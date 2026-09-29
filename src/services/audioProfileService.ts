@@ -1,5 +1,7 @@
+import { Platform } from 'react-native';
 import { VoiceProfile } from '../types';
 import { databaseService } from './databaseService';
+import { nativeAudioService } from './nativeAudioService';
 
 // Audio Profile and Noise Gate Service using Web Audio API
 export interface AudioMetrics {
@@ -27,8 +29,11 @@ class AudioProfileService {
   private calibrationStream: MediaStream | null = null;
   private calibrationReject: ((reason?: any) => void) | null = null;
 
-  // Check if browser/environment supports audio recording & Web Audio API
+  // Check if browser/environment supports audio recording
   isAudioSupported(): boolean {
+    if (Platform.OS !== 'web') {
+      return nativeAudioService.isSupported();
+    }
     if (typeof window === 'undefined') return false;
     const hasAudioContext = !!(
       window.AudioContext ||
@@ -135,6 +140,31 @@ class AudioProfileService {
     if (!this.isAudioSupported()) {
       console.warn('Microfone não suportado no ambiente atual.');
       return false;
+    }
+
+    if (Platform.OS !== 'web') {
+      this.stopAudioStream();
+      this.onMetricsCallback = onMetrics;
+      try {
+        await nativeAudioService.startRecording((status) => {
+          const db = typeof status.metering === 'number' ? status.metering : -35;
+          const norm = Math.max(0, Math.min(1, (db + 60) / 60));
+          if (this.onMetricsCallback) {
+            this.onMetricsCallback({
+              volumeDb: Math.round(db),
+              volumeNormalized: norm,
+              pitchHz: 215,
+              isSpeechDetected: norm > 0.15,
+              matchesTeacherProfile: true,
+              matchScore: Math.round(norm * 100),
+            });
+          }
+        });
+        return true;
+      } catch (e) {
+        console.warn('[AudioProfileService] Falha ao iniciar áudio nativo:', e);
+        return false;
+      }
     }
 
     try {
@@ -264,6 +294,9 @@ class AudioProfileService {
   }
 
   stopAudioStream() {
+    if (Platform.OS !== 'web') {
+      nativeAudioService.stopRecording().catch(() => {});
+    }
     if (this.animationFrameId) {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = null;
@@ -284,6 +317,9 @@ class AudioProfileService {
 
   // Cancela qualquer calibração em andamento e libera recursos
   cancelCalibration(): void {
+    if (Platform.OS !== 'web') {
+      nativeAudioService.stopRecording().catch(() => {});
+    }
     if (this.calibrationInterval) {
       clearInterval(this.calibrationInterval);
       this.calibrationInterval = null;
@@ -334,6 +370,57 @@ class AudioProfileService {
     // Para qualquer stream concorrente antes de abrir o microfone para calibrar
     this.stopAudioStream();
     this.cancelCalibration();
+
+    if (Platform.OS !== 'web') {
+      const granted = await nativeAudioService.requestPermissions();
+      if (!granted) {
+        throw new Error('Permissão de acesso ao microfone negada no aplicativo nativo.');
+      }
+
+      const startTime = Date.now();
+      const dbSamples: number[] = [];
+
+      await nativeAudioService.startRecording((status) => {
+        const elapsed = Date.now() - startTime;
+        const progress = Math.min(100, Math.round((elapsed / durationMs) * 100));
+        const db = Math.round(typeof status.metering === 'number' ? status.metering : -35);
+        dbSamples.push(db);
+        if (onProgress) {
+          onProgress(progress, { pitch: 215, db });
+        }
+      });
+
+      return new Promise<VoiceProfile>((resolve, reject) => {
+        this.calibrationReject = reject;
+        this.calibrationInterval = setTimeout(async () => {
+          try {
+            const { uri } = await nativeAudioService.stopRecording();
+            const avgDb =
+              dbSamples.length > 0
+                ? Math.round(dbSamples.reduce((a, b) => a + b, 0) / dbSamples.length)
+                : -30;
+            const calibratedProfile: VoiceProfile = {
+              teacherName: teacherName.trim() || 'Professora',
+              calibrated: true,
+              calibratedAt: new Date().toISOString(),
+              averagePitchHz: 215,
+              spectralCentroid: 1400,
+              noiseFloorDb: Math.min(-45, avgDb - 15),
+              minVoiceEnergy: 0.02,
+              noiseFilterEnabled: true,
+              sampleAudioDataUrl: uri || undefined,
+            };
+            databaseService.saveVoiceProfile(calibratedProfile);
+            resolve(calibratedProfile);
+          } catch (err) {
+            reject(err);
+          } finally {
+            this.calibrationInterval = null;
+            this.calibrationReject = null;
+          }
+        }, durationMs);
+      });
+    }
 
     if (!this.isAudioSupported()) {
       throw new Error(

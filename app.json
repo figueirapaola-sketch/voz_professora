@@ -32,6 +32,13 @@
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 76
         }
+      ],
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Permitir que o Voz Professora acesse o microfone para gravação e ditado.",
+          "recordAudioAndroid": true
+        }
       ]
     ],
     "experiments": {

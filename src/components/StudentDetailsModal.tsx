@@ -11,6 +11,7 @@ import {
   View,
 } from 'react-native';
 import { Note, NoteCategory, Student } from '../types';
+import { nativeAudioService } from '../services/nativeAudioService';
 
 interface StudentDetailsModalProps {
   visible: boolean;
@@ -45,6 +46,7 @@ export const StudentDetailsModal: React.FC<StudentDetailsModalProps> = ({
   const [selectedCategory, setSelectedCategory] = useState<NoteCategory>('pedagógico');
   const [isAddingNote, setIsAddingNote] = useState(false);
   const [copiedNotification, setCopiedNotification] = useState(false);
+  const [playingNoteId, setPlayingNoteId] = useState<string | null>(null);
 
   if (!student) return null;
 
@@ -75,20 +77,43 @@ export const StudentDetailsModal: React.FC<StudentDetailsModalProps> = ({
     }
   };
 
+  const handleModalClose = async () => {
+    await nativeAudioService.stopPlayback();
+    setPlayingNoteId(null);
+    onClose();
+  };
+
+  const handleTogglePlayAudio = async (noteId: string, audioUri: string) => {
+    if (playingNoteId === noteId) {
+      await nativeAudioService.stopPlayback();
+      setPlayingNoteId(null);
+    } else {
+      try {
+        setPlayingNoteId(noteId);
+        await nativeAudioService.playAudio(audioUri, () => {
+          setPlayingNoteId(null);
+        });
+      } catch (e) {
+        setPlayingNoteId(null);
+        Alert.alert('Áudio', 'Não foi possível reproduzir este áudio gravado.');
+      }
+    }
+  };
+
   const handleDeleteStudentPrompt = () => {
     if (typeof window !== 'undefined' && window.confirm) {
       if (window.confirm(`Tem certeza que deseja excluir a pasta de ${student.name} e todas as suas ${notes.length} anotações?`)) {
+        handleModalClose();
         onDeleteStudent(student.id);
-        onClose();
       }
     } else {
+      handleModalClose();
       onDeleteStudent(student.id);
-      onClose();
     }
   };
 
   return (
-    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
+    <Modal visible={visible} animationType="slide" transparent onRequestClose={handleModalClose}>
       <View style={styles.modalOverlay}>
         <View style={styles.modalContainer}>
           {/* Cabeçalho da Pasta do Aluno */}
@@ -245,6 +270,23 @@ export const StudentDetailsModal: React.FC<StudentDetailsModalProps> = ({
                     </View>
 
                     <Text style={styles.noteTextContent}>{note.text}</Text>
+
+                    {note.audioUri && (
+                      <TouchableOpacity
+                        style={styles.audioPlayBtn}
+                        onPress={() => handleTogglePlayAudio(note.id, note.audioUri!)}
+                      >
+                        <Ionicons
+                          name={playingNoteId === note.id ? 'pause-circle' : 'play-circle'}
+                          size={22}
+                          color="#2563eb"
+                        />
+                        <Text style={styles.audioPlayBtnText}>
+                          {playingNoteId === note.id ? 'Pausar áudio' : 'Ouvir gravação'}
+                          {note.audioDurationSeconds ? ` (${note.audioDurationSeconds}s)` : ''}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
                   </View>
                 );
               })
@@ -530,5 +572,23 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: '#ef4444',
     fontWeight: '500',
+  },
+  audioPlayBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 10,
+    backgroundColor: '#eff6ff',
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#bfdbfe',
+    alignSelf: 'flex-start',
+  },
+  audioPlayBtnText: {
+    fontSize: 13,
+    color: '#2563eb',
+    fontWeight: '600',
   },
 });

@@ -21,6 +21,7 @@ import { StudentFolderCard } from '../components/StudentFolderCard';
 import { VoiceCalibrationModal } from '../components/VoiceCalibrationModal';
 
 import { databaseService } from '../services/databaseService';
+import { nativeAudioService } from '../services/nativeAudioService';
 import { soundEffectsService } from '../services/soundEffectsService';
 import { speechRecognitionService } from '../services/speechRecognitionService';
 import { Note, NoteCategory, Student, SystemSettings, VoiceProfile, VoiceState } from '../types';
@@ -132,15 +133,28 @@ export default function App() {
   };
 
   // Salvar anotação
-  const handleSaveNote = (textToSave?: string, isVoice = false) => {
+  const handleSaveNote = (
+    textToSave?: string,
+    isVoice = false,
+    audioUri?: string,
+    audioDurationSeconds?: number
+  ) => {
     const content = (textToSave || transcript).trim();
-    if (!content) return;
+    if (!content && !audioUri) return;
 
     const targetStudent = selectedStudent || students[0];
     const targetStudentId = targetStudent ? targetStudent.id : 'geral';
     const targetStudentName = targetStudent ? targetStudent.name : 'Anotações Gerais';
 
-    databaseService.addNote(targetStudentId, targetStudentName, content, selectedCategory, isVoice);
+    databaseService.addNote(
+      targetStudentId,
+      targetStudentName,
+      content || 'Gravação de voz',
+      selectedCategory,
+      isVoice,
+      audioUri,
+      audioDurationSeconds
+    );
 
     setTranscript('');
     setStudents(databaseService.getStudents());
@@ -153,12 +167,44 @@ export default function App() {
     }
   };
 
-  // Alternar microfone
-  const handleToggleMic = () => {
+  // Alternar microfone (com suporte oficial a expo-audio em ambiente nativo)
+  const handleToggleMic = async () => {
     if (voiceState === 'recording_dictation' || voiceState === 'listening_wake_word') {
-      speechRecognitionService.stop();
+      if (Platform.OS !== 'web' && nativeAudioService.isRecording()) {
+        try {
+          const { uri, durationMillis } = await nativeAudioService.stopRecording();
+          setVoiceState('idle');
+          if (uri) {
+            const durationSec = Math.max(1, Math.round(durationMillis / 1000));
+            handleSaveNote(
+              `Gravação de voz (${durationSec}s)`,
+              true,
+              uri,
+              durationSec
+            );
+          }
+        } catch (e: any) {
+          setVoiceState('idle');
+          showToast('Erro ao finalizar gravação.');
+        }
+      } else {
+        speechRecognitionService.stop();
+      }
     } else {
-      speechRecognitionService.startDictation();
+      if (Platform.OS !== 'web') {
+        try {
+          soundEffectsService.playWakeWordChime();
+          setVoiceState('recording_dictation');
+          setTranscript('Gravando áudio do microfone (expo-audio)...');
+          await nativeAudioService.startRecording();
+          showToast('🎙️ Gravando áudio... Toque novamente no microfone para salvar.');
+        } catch (err: any) {
+          setVoiceState('idle');
+          showToast(err?.message || 'Permissão de microfone necessária.');
+        }
+      } else {
+        speechRecognitionService.startDictation();
+      }
     }
   };
 

@@ -17,6 +17,8 @@ export interface Note {
   category: NoteCategory;
   createdAt: string;
   recordedViaVoice: boolean;
+  audioUri?: string;
+  audioDurationSeconds?: number;
 }
 
 export interface VoiceProfile {

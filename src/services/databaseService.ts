@@ -204,7 +204,9 @@ export const databaseService = {
     studentName: string, 
     text: string, 
     category: Note['category'] = 'geral',
-    recordedViaVoice = true
+    recordedViaVoice = true,
+    audioUri?: string,
+    audioDurationSeconds?: number
   ): Note {
     const notes = this.getNotes();
     const newNote: Note = {
@@ -215,6 +217,8 @@ export const databaseService = {
       category,
       createdAt: new Date().toISOString(),
       recordedViaVoice,
+      audioUri,
+      audioDurationSeconds,
     };
 
     const updatedNotes = [newNote, ...notes];
