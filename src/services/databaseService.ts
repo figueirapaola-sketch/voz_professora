@@ -1,11 +1,45 @@
 import { Note, Student, SystemSettings, VoiceProfile } from '../types';
+import { secureStorageService } from './secureStorageService';
 
 const STORAGE_KEYS = {
   STUDENTS: '@voz_professora_students_v1',
   NOTES: '@voz_professora_notes_v1',
   VOICE_PROFILE: '@voz_professora_voice_profile_v1',
   SETTINGS: '@voz_professora_settings_v1',
+  SECURE_KEY_CIPHER: '@voz_professora_sec_cipher_v1',
 };
+
+// Criptografia reversível local para garantir que a chave nunca seja salva em texto puro
+function encryptLocalSecret(plain: string): string {
+  if (!plain) return '';
+  const salt = 0x5d;
+  let enc = '';
+  for (let i = 0; i < plain.length; i++) {
+    enc += String.fromCharCode(plain.charCodeAt(i) ^ (salt + (i % 11)));
+  }
+  try {
+    return 'vp_sec_' + btoa(enc);
+  } catch {
+    return 'vp_sec_' + enc;
+  }
+}
+
+function decryptLocalSecret(cipher: string): string {
+  if (!cipher || !cipher.startsWith('vp_sec_')) return '';
+  const raw = cipher.replace('vp_sec_', '');
+  let decoded = raw;
+  try {
+    decoded = atob(raw);
+  } catch {
+    decoded = raw;
+  }
+  const salt = 0x5d;
+  let dec = '';
+  for (let i = 0; i < decoded.length; i++) {
+    dec += String.fromCharCode(decoded.charCodeAt(i) ^ (salt + (i % 11)));
+  }
+  return dec;
+}
 
 // Memory fallback for non-browser environments
 const memoryStorage: Record<string, string> = {};
@@ -107,6 +141,11 @@ const DEFAULT_SETTINGS: SystemSettings = {
   speakConfirmation: true,
   continuousListening: false,
   selectedStudentId: 'student-1',
+  transcriptionApiKey: '',
+  transcriptionProvider: 'groq',
+  customTranscriptionUrl: '',
+  wakeWordSensitivity: 'media',
+  offlineWakeWordEnabled: true,
 };
 
 const DEFAULT_VOICE_PROFILE: VoiceProfile = {
@@ -253,6 +292,22 @@ export const databaseService = {
     }
   },
 
+  updateNoteText(noteId: string, newText: string): Note | null {
+    const notes = this.getNotes();
+    let updatedNote: Note | null = null;
+    const updatedNotes = notes.map((n) => {
+      if (n.id === noteId) {
+        updatedNote = { ...n, text: newText.trim() };
+        return updatedNote;
+      }
+      return n;
+    });
+    if (updatedNote) {
+      safeSetItem(STORAGE_KEYS.NOTES, JSON.stringify(updatedNotes));
+    }
+    return updatedNote;
+  },
+
   // --- PERFIL DE VOZ DA PROFESSORA ---
   getVoiceProfile(): VoiceProfile {
     const raw = safeGetItem(STORAGE_KEYS.VOICE_PROFILE);
@@ -268,21 +323,139 @@ export const databaseService = {
     safeSetItem(STORAGE_KEYS.VOICE_PROFILE, JSON.stringify(profile));
   },
 
-  // --- CONFIGURAÇÕES ---
+  // --- CONFIGURAÇÕES & ARMAZENAMENTO SEGURO ---
   getSettings(): SystemSettings {
     const raw = safeGetItem(STORAGE_KEYS.SETTINGS);
-    if (!raw) return DEFAULT_SETTINGS;
-    try {
-      return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
-    } catch {
-      return DEFAULT_SETTINGS;
+    let settings: SystemSettings = { ...DEFAULT_SETTINGS };
+    if (raw) {
+      try {
+        settings = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+      } catch {
+        settings = { ...DEFAULT_SETTINGS };
+      }
     }
+
+    // Migração transparente de chave legada em texto puro para o armazenamento seguro
+    if (settings.transcriptionApiKey && settings.transcriptionApiKey.trim()) {
+      const legacyKey = settings.transcriptionApiKey.trim();
+      this.saveSecureTranscriptionKey(legacyKey);
+      delete settings.transcriptionApiKey;
+      safeSetItem(STORAGE_KEYS.SETTINGS, JSON.stringify(settings));
+    }
+
+    // Injeta a chave segura decifrada do banco local ou Keystore
+    const secureKey = this.getSecureTranscriptionKeySync();
+    return {
+      ...settings,
+      transcriptionApiKey: secureKey,
+    };
   },
 
   saveSettings(settings: Partial<SystemSettings>): SystemSettings {
     const current = this.getSettings();
-    const updated = { ...current, ...settings };
-    safeSetItem(STORAGE_KEYS.SETTINGS, JSON.stringify(updated));
-    return updated;
+
+    // Se fornecida nova transcriptionApiKey, salva de forma segura criptografada
+    if (settings.transcriptionApiKey !== undefined) {
+      const cleanKey = settings.transcriptionApiKey.trim();
+      this.saveSecureTranscriptionKey(cleanKey);
+    }
+
+    const secureKey = this.getSecureTranscriptionKeySync();
+
+    // Sanitiza para NUNCA salvar a chave em texto puro no JSON do banco/localStorage
+    const toPersist: Partial<SystemSettings> = { ...current, ...settings };
+    const sanitizedToPersist = { ...toPersist };
+    delete sanitizedToPersist.transcriptionApiKey;
+
+    safeSetItem(STORAGE_KEYS.SETTINGS, JSON.stringify(sanitizedToPersist));
+
+    return {
+      ...toPersist,
+      transcriptionApiKey: secureKey,
+    } as SystemSettings;
+  },
+
+  // Operações dedicadas com a chave segura
+  async getSecureTranscriptionKey(): Promise<string> {
+    const syncKey = this.getSecureTranscriptionKeySync();
+    if (syncKey) return syncKey;
+    const fromService = await secureStorageService.getApiKey();
+    if (fromService) {
+      safeSetItem(STORAGE_KEYS.SECURE_KEY_CIPHER, encryptLocalSecret(fromService));
+      return fromService;
+    }
+    return '';
+  },
+
+  getSecureTranscriptionKeySync(): string {
+    const fromMemory = secureStorageService.getApiKeySync();
+    if (fromMemory) return fromMemory;
+
+    // Recupera do cofre cifrado no banco local
+    const rawCipher = safeGetItem(STORAGE_KEYS.SECURE_KEY_CIPHER);
+    if (rawCipher) {
+      const decrypted = decryptLocalSecret(rawCipher);
+      if (decrypted) {
+        secureStorageService.saveApiKey(decrypted);
+        return decrypted;
+      }
+    }
+
+    return '';
+  },
+
+  async saveSecureTranscriptionKey(key: string): Promise<void> {
+    const cleanKey = (key || '').trim();
+    if (cleanKey) {
+      safeSetItem(STORAGE_KEYS.SECURE_KEY_CIPHER, encryptLocalSecret(cleanKey));
+      await secureStorageService.saveApiKey(cleanKey);
+    } else {
+      await this.deleteSecureTranscriptionKey();
+      return;
+    }
+
+    // Garante que não haja resquício em texto puro
+    const raw = safeGetItem(STORAGE_KEYS.SETTINGS);
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed.transcriptionApiKey) {
+          delete parsed.transcriptionApiKey;
+          safeSetItem(STORAGE_KEYS.SETTINGS, JSON.stringify(parsed));
+        }
+      } catch {
+        // ignore
+      }
+    }
+  },
+
+  async deleteSecureTranscriptionKey(): Promise<void> {
+    safeSetItem(STORAGE_KEYS.SECURE_KEY_CIPHER, '');
+    await secureStorageService.deleteApiKey();
+    const raw = safeGetItem(STORAGE_KEYS.SETTINGS);
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed.transcriptionApiKey) {
+          delete parsed.transcriptionApiKey;
+          safeSetItem(STORAGE_KEYS.SETTINGS, JSON.stringify(parsed));
+        }
+      } catch {
+        // ignore
+      }
+    }
+  },
+
+  hasSecureTranscriptionKey(): boolean {
+    return !!this.getSecureTranscriptionKeySync();
+  },
+
+  getMaskedTranscriptionKey(): string {
+    const key = this.getSecureTranscriptionKeySync();
+    return secureStorageService.maskApiKey(key);
+  },
+
+  getSecurityLabel(): string {
+    return secureStorageService.getSecurityLabel();
   },
 };

@@ -44,8 +44,16 @@ class SpeechRecognitionService {
     this.initRecognition();
   }
 
-  private initRecognition() {
-    if (typeof window === 'undefined') return;
+  public checkIsMobile(): boolean {
+    if (typeof window === 'undefined' || typeof navigator === 'undefined') return false;
+    return (
+      /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ||
+      (typeof navigator.maxTouchPoints === 'number' && navigator.maxTouchPoints > 2)
+    );
+  }
+
+  private initRecognition(): boolean {
+    if (typeof window === 'undefined') return false;
 
     const SpeechRec =
       (window as any).SpeechRecognition ||
@@ -53,25 +61,40 @@ class SpeechRecognitionService {
 
     if (!SpeechRec) {
       console.warn('SpeechRecognition não suportado neste navegador/ambiente.');
-      return;
+      return false;
     }
 
     try {
-      this.recognition = new SpeechRec();
-      if (!this.recognition) return;
-      this.recognition.continuous = true;
-      this.recognition.interimResults = true;
-      this.recognition.lang = 'pt-BR';
-      this.recognition.maxAlternatives = 1;
+      if (this.recognition) {
+        try {
+          this.recognition.abort();
+        } catch {
+          // ignore
+        }
+      }
 
-      this.recognition.onresult = (event: any) => this.handleResult(event);
-      this.recognition.onerror = (event: any) => this.handleError(event);
-      this.recognition.onend = () => this.handleEnd();
-      this.recognition.onstart = () => {
+      const rec = new SpeechRec();
+      const isMobile = this.checkIsMobile();
+
+      // Navegadores móveis (Chrome no Android e Safari no iOS) falham/fecham imediatamente com continuous: true.
+      // Em celulares, usamos continuous: false e encadeamos os resultados suavemente no onend.
+      rec.continuous = !isMobile;
+      rec.interimResults = true;
+      rec.lang = 'pt-BR';
+      rec.maxAlternatives = 1;
+
+      rec.onresult = (event: any) => this.handleResult(event);
+      rec.onerror = (event: any) => this.handleError(event);
+      rec.onend = () => this.handleEnd();
+      rec.onstart = () => {
         // Recognition started
       };
+
+      this.recognition = rec;
+      return true;
     } catch (e) {
       console.error('Erro ao instanciar SpeechRecognition:', e);
+      return false;
     }
   }
 
@@ -94,13 +117,21 @@ class SpeechRecognitionService {
   }
 
   // Inicia a escuta contínua no modo Palavra-Chave ("Standby")
-  startWakeWordListening() {
-    if (!this.recognition) {
-      this.initRecognition();
-    }
+  async startWakeWordListening() {
+    this.initRecognition();
     if (!this.recognition) {
       this.callbacks?.onError('Reconhecimento de voz não suportado pelo navegador.');
       return;
+    }
+
+    // Em celular, solicita permissão de microfone se necessário
+    if (this.checkIsMobile() && typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((track) => track.stop());
+      } catch {
+        // ignora se já concedido ou negado
+      }
     }
 
     this.isUserInitiatedStop = false;
@@ -112,7 +143,6 @@ class SpeechRecognitionService {
     try {
       this.recognition.start();
     } catch (e: any) {
-      // Já pode estar rodando
       if (e.name !== 'InvalidStateError') {
         console.warn('Erro ao iniciar reconhecimento:', e);
       }
@@ -120,7 +150,7 @@ class SpeechRecognitionService {
   }
 
   // Ativa manualmente o ditado (ex: clicando no microfone)
-  startDictation() {
+  async startDictation() {
     soundEffectsService.playWakeWordChime();
     this.currentTranscript = '';
     this.interimTranscript = '';
@@ -128,9 +158,17 @@ class SpeechRecognitionService {
     this.setState('recording_dictation');
     this.resetSilenceCountdown();
 
-    if (!this.recognition) {
-      this.initRecognition();
+    this.initRecognition();
+
+    if (this.checkIsMobile() && typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((track) => track.stop());
+      } catch (err: any) {
+        console.warn('Microphone permission check:', err);
+      }
     }
+
     try {
       this.isUserInitiatedStop = false;
       this.recognition?.start();
@@ -157,7 +195,7 @@ class SpeechRecognitionService {
     this.setState('idle');
   }
 
-  // Gerencia o temporizador de 10 segundos de silêncio
+  // Gerencia o temporizador de silêncio
   private resetSilenceCountdown() {
     this.clearCountdown();
 
@@ -187,7 +225,7 @@ class SpeechRecognitionService {
     }
   }
 
-  // Finaliza a anotação automaticamente após os 10s de silêncio ou por comando
+  // Finaliza a anotação automaticamente após silêncio ou por comando
   finalizeDictation() {
     this.clearCountdown();
     const finalNote = (this.currentTranscript + ' ' + this.interimTranscript).trim();
@@ -219,7 +257,7 @@ class SpeechRecognitionService {
 
     for (let i = event.resultIndex; i < event.results.length; ++i) {
       const item = event.results[i];
-      const text = item[0].transcript;
+      const text = item[0]?.transcript || '';
       if (item.isFinal) {
         finalChunk += text + ' ';
       } else {
@@ -268,7 +306,7 @@ class SpeechRecognitionService {
 
     // 2. SE JÁ ESTÁ EM MODO DE GRAVAÇÃO DO DITADO:
     if (this.state === 'recording_dictation') {
-      // Se a professora voltar a falar, zera o contador regressivo dos 10 segundos!
+      // Se a professora voltar a falar, zera o contador regressivo de silêncio!
       this.resetSilenceCountdown();
 
       // Verifica comandos rápidos de finalização ou cancelamento
@@ -295,8 +333,8 @@ class SpeechRecognitionService {
     }
   }
 
-  // Identifica comandos especiais na fala
-  private parseVoiceCommand(text: string): VoiceCommandDetection {
+  // Identifica comandos especiais na fala (público para reaproveitamento nativo)
+  public parseVoiceCommand(text: string): VoiceCommandDetection {
     const clean = text.toLowerCase().trim();
 
     // Comando 1: Criar pasta de aluno
@@ -344,27 +382,46 @@ class SpeechRecognitionService {
   }
 
   private handleError(event: any) {
-    // Ignora 'no-speech' em escuta contínua
     if (event.error === 'no-speech') {
       return;
     }
     if (event.error === 'aborted') {
       return;
     }
+
+    if (event.error === 'not-allowed') {
+      if (
+        typeof window !== 'undefined' &&
+        window.isSecureContext === false &&
+        window.location.hostname !== 'localhost' &&
+        window.location.hostname !== '127.0.0.1'
+      ) {
+        this.callbacks?.onError(
+          'Atenção: Navegadores no celular exigem HTTPS para o microfone. Use "npx expo start --tunnel" para gerar o link seguro.'
+        );
+        return;
+      }
+      this.callbacks?.onError('Permissão de microfone negada no navegador. Autorize o acesso nas configurações do site.');
+      return;
+    }
+
     console.warn('Erro no reconhecimento de fala:', event.error);
     this.callbacks?.onError(`Reconhecimento de fala: ${event.error}`);
   }
 
   private handleEnd() {
-    // Reinicia automaticamente se estiver em modo de escuta contínua e o usuário não tiver parado manualmente
+    // No celular com continuous: false, quando o usuário pausa a fala, reinicia para continuar capturando
     if (!this.isUserInitiatedStop && (this.state === 'listening_wake_word' || this.state === 'recording_dictation')) {
       this.restartTimeout = setTimeout(() => {
         try {
+          if (this.checkIsMobile()) {
+            this.initRecognition();
+          }
           this.recognition?.start();
         } catch {
           // ignore
         }
-      }, 350);
+      }, 250);
     }
   }
 }

@@ -1,6 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import React, { useState } from 'react';
 import {
+  ActivityIndicator,
   Alert,
   Modal,
   ScrollView,
@@ -11,7 +12,9 @@ import {
   View,
 } from 'react-native';
 import { Note, NoteCategory, Student } from '../types';
+import { databaseService } from '../services/databaseService';
 import { nativeAudioService } from '../services/nativeAudioService';
+import { transcriptionService } from '../services/transcriptionService';
 
 interface StudentDetailsModalProps {
   visible: boolean;
@@ -22,6 +25,8 @@ interface StudentDetailsModalProps {
   onDeleteNote: (noteId: string) => void;
   onDeleteStudent: (studentId: string) => void;
   onStartVoiceForStudent: (student: Student) => void;
+  onOpenTranscriptionSettings?: () => void;
+  onNotesUpdated?: () => void;
 }
 
 const CATEGORIES: { label: string; value: NoteCategory; color: string }[] = [
@@ -41,14 +46,53 @@ export const StudentDetailsModal: React.FC<StudentDetailsModalProps> = ({
   onDeleteNote,
   onDeleteStudent,
   onStartVoiceForStudent,
+  onOpenTranscriptionSettings,
+  onNotesUpdated,
 }) => {
   const [newNoteText, setNewNoteText] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<NoteCategory>('pedagógico');
   const [isAddingNote, setIsAddingNote] = useState(false);
   const [copiedNotification, setCopiedNotification] = useState(false);
   const [playingNoteId, setPlayingNoteId] = useState<string | null>(null);
+  const [transcribingNoteId, setTranscribingNoteId] = useState<string | null>(null);
 
   if (!student) return null;
+
+  const handleTranscribeNoteAudio = async (note: Note) => {
+    if (!note.audioUri) return;
+    setTranscribingNoteId(note.id);
+    try {
+      const res = await transcriptionService.transcribeAudio(note.audioUri, note.audioDurationSeconds);
+      if (res.success && res.text) {
+        databaseService.updateNoteText(note.id, res.text);
+        onNotesUpdated?.();
+        Alert.alert('✅ Transcrição Concluída', `Texto gerado: "${res.text}"`);
+      } else {
+        if (res.error === 'NO_KEY') {
+          Alert.alert(
+            'Chave Groq Não Configurada',
+            'Para transcrever áudio em texto no celular, configure sua chave gratuita do Groq Whisper.',
+            [
+              { text: 'Cancelar', style: 'cancel' },
+              {
+                text: 'Configurar Chave',
+                onPress: () => {
+                  onClose();
+                  onOpenTranscriptionSettings?.();
+                },
+              },
+            ]
+          );
+        } else {
+          Alert.alert('Erro ao Transcrever', res.error || 'Não foi possível processar o áudio.');
+        }
+      }
+    } catch (err: any) {
+      Alert.alert('Erro', err?.message || 'Falha ao processar áudio.');
+    } finally {
+      setTranscribingNoteId(null);
+    }
+  };
 
   const handleSaveNote = () => {
     if (!newNoteText.trim()) return;
@@ -272,20 +316,41 @@ export const StudentDetailsModal: React.FC<StudentDetailsModalProps> = ({
                     <Text style={styles.noteTextContent}>{note.text}</Text>
 
                     {note.audioUri && (
-                      <TouchableOpacity
-                        style={styles.audioPlayBtn}
-                        onPress={() => handleTogglePlayAudio(note.id, note.audioUri!)}
-                      >
-                        <Ionicons
-                          name={playingNoteId === note.id ? 'pause-circle' : 'play-circle'}
-                          size={22}
-                          color="#2563eb"
-                        />
-                        <Text style={styles.audioPlayBtnText}>
-                          {playingNoteId === note.id ? 'Pausar áudio' : 'Ouvir gravação'}
-                          {note.audioDurationSeconds ? ` (${note.audioDurationSeconds}s)` : ''}
-                        </Text>
-                      </TouchableOpacity>
+                      <View style={styles.audioActionRow}>
+                        <TouchableOpacity
+                          style={styles.audioPlayBtn}
+                          onPress={() => handleTogglePlayAudio(note.id, note.audioUri!)}
+                        >
+                          <Ionicons
+                            name={playingNoteId === note.id ? 'pause-circle' : 'play-circle'}
+                            size={20}
+                            color="#2563eb"
+                          />
+                          <Text style={styles.audioPlayBtnText}>
+                            {playingNoteId === note.id ? 'Pausar' : 'Ouvir'}
+                            {note.audioDurationSeconds ? ` (${note.audioDurationSeconds}s)` : ''}
+                          </Text>
+                        </TouchableOpacity>
+
+                        <TouchableOpacity
+                          style={styles.transcribeActionBtn}
+                          onPress={() => handleTranscribeNoteAudio(note)}
+                          disabled={transcribingNoteId === note.id}
+                        >
+                          {transcribingNoteId === note.id ? (
+                            <ActivityIndicator size="small" color="#15803d" />
+                          ) : (
+                            <Ionicons name="sparkles" size={15} color="#15803d" />
+                          )}
+                          <Text style={styles.transcribeActionText}>
+                            {transcribingNoteId === note.id
+                              ? 'Transcrevendo...'
+                              : note.text.startsWith('Gravação de voz') || note.text.startsWith('Gravação de áudio')
+                              ? 'Transcrever Áudio'
+                              : 'Re-transcrever'}
+                          </Text>
+                        </TouchableOpacity>
+                      </View>
                     )}
                   </View>
                 );
@@ -573,11 +638,17 @@ const styles = StyleSheet.create({
     color: '#ef4444',
     fontWeight: '500',
   },
+  audioActionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 8,
+    flexWrap: 'wrap',
+  },
   audioPlayBtn: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    marginTop: 10,
     backgroundColor: '#eff6ff',
     paddingVertical: 6,
     paddingHorizontal: 12,
@@ -589,6 +660,23 @@ const styles = StyleSheet.create({
   audioPlayBtnText: {
     fontSize: 13,
     color: '#2563eb',
+    fontWeight: '600',
+  },
+  transcribeActionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: '#f0fdf4',
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#bbf7d0',
+    alignSelf: 'flex-start',
+  },
+  transcribeActionText: {
+    fontSize: 12,
+    color: '#15803d',
     fontWeight: '600',
   },
 });

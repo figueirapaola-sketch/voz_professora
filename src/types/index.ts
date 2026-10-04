@@ -46,6 +46,11 @@ export interface SystemSettings {
   speakConfirmation: boolean;
   continuousListening: boolean;
   selectedStudentId: string | null;
+  transcriptionApiKey?: string;
+  transcriptionProvider?: 'groq' | 'openai' | 'custom';
+  customTranscriptionUrl?: string;
+  wakeWordSensitivity?: 'baixa' | 'media' | 'alta';
+  offlineWakeWordEnabled?: boolean;
 }
 
 export interface VoiceCommandDetection {

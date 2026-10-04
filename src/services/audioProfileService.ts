@@ -143,28 +143,32 @@ class AudioProfileService {
     }
 
     if (Platform.OS !== 'web') {
-      this.stopAudioStream();
       this.onMetricsCallback = onMetrics;
-      try {
-        await nativeAudioService.startRecording((status) => {
-          const db = typeof status.metering === 'number' ? status.metering : -35;
-          const norm = Math.max(0, Math.min(1, (db + 60) / 60));
-          if (this.onMetricsCallback) {
-            this.onMetricsCallback({
-              volumeDb: Math.round(db),
-              volumeNormalized: norm,
-              pitchHz: 215,
-              isSpeechDetected: norm > 0.15,
-              matchesTeacherProfile: true,
-              matchScore: Math.round(norm * 100),
-            });
-          }
-        });
-        return true;
-      } catch (e) {
-        console.warn('[AudioProfileService] Falha ao iniciar áudio nativo:', e);
-        return false;
+      // No celular nativo, a gravação é gerenciada exclusivamente pelo fluxo de ditado.
+      // O visualizador apenas acompanha o estado de gravação para animar as ondas visuais.
+      if (this.calibrationInterval) {
+        clearInterval(this.calibrationInterval);
       }
+      this.calibrationInterval = setInterval(() => {
+        if (!this.onMetricsCallback) {
+          clearInterval(this.calibrationInterval);
+          this.calibrationInterval = null;
+          return;
+        }
+        const isRec = nativeAudioService.isRecording();
+        const baseNorm = isRec ? 0.35 + Math.random() * 0.45 : 0;
+        const db = isRec ? Math.round(-42 + baseNorm * 32) : -60;
+        this.onMetricsCallback({
+          volumeDb: db,
+          volumeNormalized: baseNorm,
+          pitchHz: isRec ? 215 : 0,
+          isSpeechDetected: isRec,
+          matchesTeacherProfile: true,
+          matchScore: 88,
+        });
+      }, 120);
+
+      return true;
     }
 
     try {
@@ -295,7 +299,11 @@ class AudioProfileService {
 
   stopAudioStream() {
     if (Platform.OS !== 'web') {
-      nativeAudioService.stopRecording().catch(() => {});
+      if (this.calibrationInterval) {
+        clearInterval(this.calibrationInterval);
+        this.calibrationInterval = null;
+      }
+      return;
     }
     if (this.animationFrameId) {
       cancelAnimationFrame(this.animationFrameId);
@@ -317,12 +325,13 @@ class AudioProfileService {
 
   // Cancela qualquer calibração em andamento e libera recursos
   cancelCalibration(): void {
-    if (Platform.OS !== 'web') {
-      nativeAudioService.stopRecording().catch(() => {});
-    }
     if (this.calibrationInterval) {
       clearInterval(this.calibrationInterval);
+      clearTimeout(this.calibrationInterval);
       this.calibrationInterval = null;
+      if (Platform.OS !== 'web') {
+        nativeAudioService.stopRecording().catch(() => {});
+      }
     }
     if (this.calibrationStream) {
       this.calibrationStream.getTracks().forEach((track) => track.stop());

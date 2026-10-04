@@ -1,6 +1,7 @@
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import React, { useEffect, useState } from 'react';
 import {
+  ActivityIndicator,
   Alert,
   Platform,
   SafeAreaView,
@@ -18,12 +19,16 @@ import { CountdownTimer } from '../components/CountdownTimer';
 import { NewStudentModal } from '../components/NewStudentModal';
 import { StudentDetailsModal } from '../components/StudentDetailsModal';
 import { StudentFolderCard } from '../components/StudentFolderCard';
+import { TranscriptionSettingsModal } from '../components/TranscriptionSettingsModal';
 import { VoiceCalibrationModal } from '../components/VoiceCalibrationModal';
+import { WakeWordSettingsModal } from '../components/WakeWordSettingsModal';
 
 import { databaseService } from '../services/databaseService';
 import { nativeAudioService } from '../services/nativeAudioService';
+import { offlineWakeWordService } from '../services/offlineWakeWordService';
 import { soundEffectsService } from '../services/soundEffectsService';
 import { speechRecognitionService } from '../services/speechRecognitionService';
+import { transcriptionService } from '../services/transcriptionService';
 import { Note, NoteCategory, Student, SystemSettings, VoiceProfile, VoiceState } from '../types';
 
 export default function App() {
@@ -51,11 +56,25 @@ export default function App() {
   // Modais
   const [isNewStudentModalOpen, setIsNewStudentModalOpen] = useState(false);
   const [isCalibrationModalOpen, setIsCalibrationModalOpen] = useState(false);
+  const [isTranscriptionModalOpen, setIsTranscriptionModalOpen] = useState(false);
+  const [isWakeWordModalOpen, setIsWakeWordModalOpen] = useState(false);
   const [detailsStudent, setDetailsStudent] = useState<Student | null>(null);
 
   // Carregar dados iniciais
   useEffect(() => {
     loadData();
+    databaseService.getSecureTranscriptionKey().then(() => {
+      setSettings(databaseService.getSettings());
+    });
+    const saved = databaseService.getSettings();
+    if (saved.continuousListening) {
+      setTimeout(() => {
+        startOfflineWakeWord();
+      }, 1000);
+    }
+    return () => {
+      offlineWakeWordService.stopListening();
+    };
   }, []);
 
   const loadData = () => {
@@ -93,6 +112,11 @@ export default function App() {
       },
       onAutoFinalize: (finalText) => {
         handleSaveNote(finalText, true);
+        if (databaseService.getSettings().continuousListening) {
+          setTimeout(() => {
+            startOfflineWakeWord();
+          }, 1200);
+        }
       },
       onError: (errMsg) => {
         showToast(errMsg);
@@ -167,40 +191,101 @@ export default function App() {
     }
   };
 
-  // Alternar microfone (com suporte oficial a expo-audio em ambiente nativo)
+  // Alternar microfone (com suporte oficial a expo-audio e transcrição automática no celular)
   const handleToggleMic = async () => {
-    if (voiceState === 'recording_dictation' || voiceState === 'listening_wake_word') {
-      if (Platform.OS !== 'web' && nativeAudioService.isRecording()) {
+    // Previne cliques múltiplos durante o salvamento ou finalização da gravação
+    if (voiceState === 'saving' || nativeAudioService.isStoppingRecording()) {
+      return;
+    }
+
+    if (voiceState === 'recording_dictation' || (Platform.OS !== 'web' && nativeAudioService.isRecording())) {
+      if (Platform.OS !== 'web') {
         try {
+          setVoiceState('saving');
+          setTranscript('⏳ Finalizando gravação e transcrevendo áudio...');
           const { uri, durationMillis } = await nativeAudioService.stopRecording();
-          setVoiceState('idle');
           if (uri) {
             const durationSec = Math.max(1, Math.round(durationMillis / 1000));
-            handleSaveNote(
-              `Gravação de voz (${durationSec}s)`,
-              true,
-              uri,
-              durationSec
-            );
+            showToast('⏳ Transcrevendo gravação em português...');
+
+            const transResult = await transcriptionService.transcribeAudio(uri, durationSec);
+            let finalNoteText = '';
+
+            if (transResult.success && transResult.text) {
+              finalNoteText = transResult.text;
+              setTranscript(finalNoteText);
+              setVoiceState('idle');
+
+              // Verifica se a professora falou comandos como "Criar pasta do aluno..." ou "Anotar para..."
+              const parsedCmd = speechRecognitionService.parseVoiceCommand(finalNoteText);
+              if (parsedCmd.type === 'create_folder' && parsedCmd.studentName) {
+                handleVoiceCommand(parsedCmd);
+              } else if (parsedCmd.type === 'dictate_to_student' && parsedCmd.studentName) {
+                handleVoiceCommand(parsedCmd);
+                handleSaveNote(parsedCmd.content || finalNoteText, true, uri, durationSec);
+              } else {
+                handleSaveNote(finalNoteText, true, uri, durationSec);
+              }
+              soundEffectsService.playSaveSuccessChime();
+            } else {
+              setVoiceState('idle');
+              finalNoteText = `Gravação de voz (${durationSec}s)`;
+              handleSaveNote(finalNoteText, true, uri, durationSec);
+
+              if (transResult.error === 'NO_KEY') {
+                setTranscript('⚠️ Áudio salvo! Para transcrever a fala em texto automaticamente, configure sua chave gratuita do Groq no topo.');
+                setIsTranscriptionModalOpen(true);
+                setTimeout(() => {
+                  showToast('🎙️ Configure sua chave gratuita do Groq para transcrição automática.');
+                }, 600);
+              } else {
+                setTranscript(`⚠️ Áudio salvo na pasta, mas a transcrição falhou: ${transResult.error || 'Erro na API'}`);
+                setTimeout(() => {
+                  showToast(transResult.error || 'Áudio gravado e salvo na pasta.');
+                }, 600);
+              }
+            }
+          } else {
+            setVoiceState('idle');
+            showToast('Nenhum áudio foi capturado. Toque novamente para gravar.');
           }
         } catch (e: any) {
           setVoiceState('idle');
-          showToast('Erro ao finalizar gravação.');
+          showToast('Erro ao processar gravação: ' + (e?.message || 'erro inesperado'));
+        } finally {
+          if (settings.continuousListening) {
+            setTimeout(() => {
+              startOfflineWakeWord();
+            }, 1200);
+          }
         }
       } else {
         speechRecognitionService.stop();
+        if (settings.continuousListening) {
+          setTimeout(() => {
+            startOfflineWakeWord();
+          }, 1200);
+        }
       }
     } else {
+      stopOfflineWakeWord();
       if (Platform.OS !== 'web') {
         try {
           soundEffectsService.playWakeWordChime();
           setVoiceState('recording_dictation');
-          setTranscript('Gravando áudio do microfone (expo-audio)...');
-          await nativeAudioService.startRecording();
-          showToast('🎙️ Gravando áudio... Toque novamente no microfone para salvar.');
+          setTranscript('🎙️ Gravando áudio pelo celular... Fale sua anotação agora.\nToque no botão central novamente para finalizar e transcrever.');
+          const started = await nativeAudioService.startRecording();
+          if (started) {
+            showToast('🎙️ Gravando... Fale sua anotação e toque no microfone para transcrever.');
+          }
         } catch (err: any) {
           setVoiceState('idle');
           showToast(err?.message || 'Permissão de microfone necessária.');
+          if (settings.continuousListening) {
+            setTimeout(() => {
+              startOfflineWakeWord();
+            }, 1000);
+          }
         }
       } else {
         speechRecognitionService.startDictation();
@@ -208,16 +293,75 @@ export default function App() {
     }
   };
 
-  // Alternar modo de escuta contínua por palavra-chave ("professora")
-  const handleToggleContinuousListening = () => {
+  // Iniciar detecção de palavra-chave offline ("Professora")
+  const startOfflineWakeWord = async () => {
+    if (voiceState === 'recording_dictation' || voiceState === 'saving') {
+      return;
+    }
+
+    setVoiceState('listening_wake_word');
+    await offlineWakeWordService.startListening({
+      onDetected: (word, confidence) => {
+        handleWakeWordTriggered(word, confidence);
+      },
+      onStateChange: (st) => {
+        if (st === 'listening') {
+          setVoiceState('listening_wake_word');
+        } else if (st === 'error') {
+          showToast('Permissão de microfone necessária para escuta contínua.');
+        }
+      },
+    });
+  };
+
+  // Parar detecção de palavra-chave offline
+  const stopOfflineWakeWord = () => {
+    offlineWakeWordService.stopListening();
+    if (voiceState === 'listening_wake_word') {
+      setVoiceState('idle');
+    }
+  };
+
+  // Disparo automático quando o usuário fala "Professora" offline
+  const handleWakeWordTriggered = async (word: string, confidence: number) => {
+    soundEffectsService.playWakeWordChime();
+    showToast(`🎙️ "${word}" detectado offline (${confidence}%)! Gravando...`);
+
+    // Pausa a escuta do wake word para liberar o microfone para a gravação da nota
+    offlineWakeWordService.stopListening();
+
+    setVoiceState('recording_dictation');
+    setTranscript('🎙️ "Professora" detectado! Fale sua anotação agora.\nToque no botão central para finalizar e transcrever.');
+
+    if (Platform.OS !== 'web') {
+      try {
+        await nativeAudioService.startRecording();
+      } catch (err: any) {
+        setVoiceState('idle');
+        showToast(err?.message || 'Erro ao iniciar gravação.');
+        if (settings.continuousListening) {
+          startOfflineWakeWord();
+        }
+      }
+    } else {
+      speechRecognitionService.startDictation();
+    }
+  };
+
+  // Alternar modo de escuta contínua por palavra-chave ("professora") 100% offline
+  const handleToggleContinuousListening = async () => {
     const updated = !settings.continuousListening;
-    const newSettings = databaseService.saveSettings({ continuousListening: updated });
+    const newSettings = databaseService.saveSettings({
+      continuousListening: updated,
+      offlineWakeWordEnabled: updated,
+    });
     setSettings(newSettings);
 
     if (updated) {
-      speechRecognitionService.startWakeWordListening();
-      showToast('Escuta contínua ativada! Diga "Professora" para acionar.');
+      await startOfflineWakeWord();
+      showToast('🟢 Escuta contínua offline ativada! Diga "Professora" para acionar.');
     } else {
+      stopOfflineWakeWord();
       speechRecognitionService.stop();
       showToast('Escuta contínua desativada.');
     }
@@ -225,6 +369,7 @@ export default function App() {
 
   // Abrir e fechar modal de calibração liberando microfone
   const handleOpenCalibrationModal = () => {
+    stopOfflineWakeWord();
     speechRecognitionService.stop();
     setIsCalibrationModalOpen(true);
   };
@@ -232,7 +377,7 @@ export default function App() {
   const handleCloseCalibrationModal = () => {
     setIsCalibrationModalOpen(false);
     if (settings.continuousListening) {
-      speechRecognitionService.startWakeWordListening();
+      startOfflineWakeWord();
     }
   };
 
@@ -283,8 +428,44 @@ export default function App() {
             </View>
           </View>
 
-          {/* Badge de Status da Voz */}
+          {/* Badge de Status da Voz e Configuração */}
           <View style={styles.headerRightActions}>
+            <TouchableOpacity
+              style={[
+                styles.wakeWordHeaderBtn,
+                settings.continuousListening && styles.wakeWordHeaderBtnActive,
+              ]}
+              onPress={() => setIsWakeWordModalOpen(true)}
+            >
+              <Ionicons
+                name="radio-outline"
+                size={15}
+                color={settings.continuousListening ? '#4ade80' : '#cbd5e1'}
+              />
+              <Text
+                style={[
+                  styles.wakeWordHeaderBtnText,
+                  settings.continuousListening && styles.wakeWordHeaderBtnTextActive,
+                ]}
+              >
+                Wake Word
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.transcriptionSettingsBtn}
+              onPress={() => setIsTranscriptionModalOpen(true)}
+            >
+              <Ionicons
+                name="settings-outline"
+                size={15}
+                color="#60a5fa"
+              />
+              <Text style={styles.transcriptionSettingsBtnText}>
+                Transcrição
+              </Text>
+            </TouchableOpacity>
+
             <TouchableOpacity
               style={styles.voiceProfileBtn}
               onPress={handleOpenCalibrationModal}
@@ -295,7 +476,7 @@ export default function App() {
                 color={voiceProfile.calibrated ? '#4ade80' : '#facc15'}
               />
               <Text style={styles.voiceProfileBtnText}>
-                {voiceProfile.calibrated ? 'Voz Calibrada' : 'Calibrar Voz'}
+                {voiceProfile.calibrated ? 'Voz Calibrada' : 'Calibrar'}
               </Text>
             </TouchableOpacity>
 
@@ -410,19 +591,27 @@ export default function App() {
                       styles.micButton,
                       isRecording && styles.micButtonRecording,
                       isListeningWakeWord && styles.micButtonListening,
+                      voiceState === 'saving' && styles.micButtonSaving,
                     ]}
                     onPress={handleToggleMic}
+                    disabled={voiceState === 'saving'}
                     activeOpacity={0.8}
                   >
-                    <MaterialCommunityIcons
-                      name={isRecording ? 'microphone' : 'microphone-outline'}
-                      size={48}
-                      color="#fff"
-                    />
+                    {voiceState === 'saving' ? (
+                      <ActivityIndicator size="large" color="#fff" />
+                    ) : (
+                      <MaterialCommunityIcons
+                        name={isRecording ? 'microphone' : 'microphone-outline'}
+                        size={48}
+                        color="#fff"
+                      />
+                    )}
                   </TouchableOpacity>
                   <Text style={styles.micStatusLabel}>
-                    {isRecording
-                      ? 'Ouvindo o que você está falando...'
+                    {voiceState === 'saving'
+                      ? 'Processando áudio e transcrevendo...'
+                      : isRecording
+                      ? 'Gravando... Fale sua anotação e toque no microfone para transcrever'
                       : isListeningWakeWord
                       ? 'Aguardando palavra-chave "Professora"'
                       : 'Toque para ditar ou ative a palavra-chave'}
@@ -437,10 +626,37 @@ export default function App() {
                   <CountdownTimer
                     remainingSeconds={remainingSilenceSeconds}
                     totalSeconds={settings.silenceTimeoutSeconds || 10}
-                    onSaveNow={() => handleSaveNote(transcript, true)}
+                    onSaveNow={() => {
+                      if (Platform.OS !== 'web') {
+                        handleToggleMic();
+                      } else {
+                        handleSaveNote(transcript, true);
+                        if (settings.continuousListening) {
+                          setTimeout(() => {
+                            startOfflineWakeWord();
+                          }, 1200);
+                        }
+                      }
+                    }}
                     onCancel={() => {
-                      speechRecognitionService.stop();
-                      setTranscript('');
+                      if (Platform.OS !== 'web') {
+                        nativeAudioService.stopRecording().catch(() => {});
+                        setVoiceState('idle');
+                        setTranscript('');
+                        if (settings.continuousListening) {
+                          setTimeout(() => {
+                            startOfflineWakeWord();
+                          }, 600);
+                        }
+                      } else {
+                        speechRecognitionService.stop();
+                        setTranscript('');
+                        if (settings.continuousListening) {
+                          setTimeout(() => {
+                            startOfflineWakeWord();
+                          }, 600);
+                        }
+                      }
                     }}
                   />
                 )}
@@ -465,10 +681,30 @@ export default function App() {
                     placeholder={
                       isRecording
                         ? 'Fale o que a professora dita (o texto aparecerá aqui automaticamente)...'
-                        : 'O texto ditado pela professora aparecerá aqui. Você também pode digitar se desejar.'
+                        : 'O texto ditado pela professora aparecerá aqui. Você também pode digitar ou usar o microfone do teclado do celular.'
                     }
                     placeholderTextColor="#94a3b8"
                   />
+
+                  {/* Dica de transcrição no celular */}
+                  {Platform.OS !== 'web' && (
+                    <TouchableOpacity
+                      style={styles.mobileTipBanner}
+                      onPress={() => setIsTranscriptionModalOpen(true)}
+                    >
+                      <Ionicons
+                        name={settings.transcriptionApiKey ? 'checkmark-circle' : 'sparkles'}
+                        size={17}
+                        color={settings.transcriptionApiKey ? '#16a34a' : '#0284c7'}
+                      />
+                      <Text style={styles.mobileTipText}>
+                        {settings.transcriptionApiKey
+                          ? 'Transcrição inteligente ativa (Groq Whisper). Grave pelo celular e o áudio será transcrito automaticamente!'
+                          : 'No celular: Toque aqui para configurar sua chave gratuita do Groq Whisper ou use o microfone do teclado do celular.'}
+                      </Text>
+                      <Ionicons name="chevron-forward" size={14} color="#0284c7" />
+                    </TouchableOpacity>
+                  )}
 
                   {transcript.trim().length > 0 && (
                     <View style={styles.transcriptActions}>
@@ -545,6 +781,19 @@ export default function App() {
                         ? 'Escuta Contínua Ligada (Sempre alerta)'
                         : 'Ativar Escuta Contínua (Acionamento por voz)'}
                     </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={styles.wakeWordSettingsPill}
+                    onPress={() => setIsWakeWordModalOpen(true)}
+                  >
+                    <View style={styles.wakeWordPillLeft}>
+                      <Ionicons name="hardware-chip" size={15} color="#15803d" />
+                      <Text style={styles.wakeWordSettingsPillText}>
+                        Wake Word Offline: "Professora" ({settings.wakeWordSensitivity === 'alta' ? 'Sensibilidade Alta' : settings.wakeWordSensitivity === 'baixa' ? 'Sensibilidade Baixa' : 'Sensibilidade Média'})
+                      </Text>
+                    </View>
+                    <Ionicons name="chevron-forward" size={15} color="#15803d" />
                   </TouchableOpacity>
                 </View>
               </View>
@@ -665,7 +914,37 @@ export default function App() {
         onStartVoiceForStudent={(st) => {
           setSelectedStudent(st);
           setActiveTab('ditado');
-          speechRecognitionService.startDictation();
+          if (Platform.OS !== 'web') {
+            handleToggleMic();
+          } else {
+            speechRecognitionService.startDictation();
+          }
+        }}
+        onOpenTranscriptionSettings={() => setIsTranscriptionModalOpen(true)}
+        onNotesUpdated={() => setStudents(databaseService.getStudents())}
+      />
+
+      {/* Modal de Configuração de Transcrição */}
+      <TranscriptionSettingsModal
+        visible={isTranscriptionModalOpen}
+        onClose={() => setIsTranscriptionModalOpen(false)}
+        onSaved={(updated) => {
+          setSettings(updated);
+          showToast('Configurações de transcrição salvas!');
+        }}
+      />
+
+      {/* Modal de Configuração de Wake Word Offline ("Professora") */}
+      <WakeWordSettingsModal
+        visible={isWakeWordModalOpen}
+        onClose={() => setIsWakeWordModalOpen(false)}
+        onSettingsUpdated={(updated) => {
+          setSettings(updated);
+          if (updated.continuousListening) {
+            startOfflineWakeWord();
+          } else {
+            stopOfflineWakeWord();
+          }
         }}
       />
     </SafeAreaView>
@@ -720,6 +999,43 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
+  },
+  wakeWordHeaderBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.15)',
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 8,
+    gap: 5,
+  },
+  wakeWordHeaderBtnActive: {
+    backgroundColor: 'rgba(34, 197, 94, 0.25)',
+    borderWidth: 1,
+    borderColor: '#4ade80',
+  },
+  wakeWordHeaderBtnText: {
+    color: '#e2e8f0',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  wakeWordHeaderBtnTextActive: {
+    color: '#86efac',
+    fontWeight: 'bold',
+  },
+  transcriptionSettingsBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.15)',
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 8,
+    gap: 5,
+  },
+  transcriptionSettingsBtnText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '600',
   },
   voiceProfileBtn: {
     flexDirection: 'row',
@@ -912,6 +1228,10 @@ const styles = StyleSheet.create({
     borderWidth: 3,
     borderColor: '#bbf7d0',
   },
+  micButtonSaving: {
+    backgroundColor: '#0284c7',
+    shadowColor: '#0284c7',
+  },
   micStatusLabel: {
     fontSize: 13,
     color: '#475569',
@@ -961,6 +1281,23 @@ const styles = StyleSheet.create({
     minHeight: 70,
     textAlignVertical: 'top',
     lineHeight: 20,
+  },
+  mobileTipBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: '#f0f9ff',
+    borderWidth: 1,
+    borderColor: '#bae6fd',
+    borderRadius: 8,
+    padding: 8,
+    marginVertical: 6,
+  },
+  mobileTipText: {
+    flex: 1,
+    fontSize: 11,
+    color: '#0369a1',
+    lineHeight: 15,
   },
   transcriptActions: {
     flexDirection: 'row',
@@ -1071,6 +1408,30 @@ const styles = StyleSheet.create({
   },
   continuousBtnTextActive: {
     color: '#fff',
+  },
+  wakeWordSettingsPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#bbf7d0',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    marginTop: 8,
+  },
+  wakeWordPillLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    flex: 1,
+  },
+  wakeWordSettingsPillText: {
+    fontSize: 12,
+    color: '#15803d',
+    fontWeight: '600',
+    flex: 1,
   },
   // Folders Header & Search
   foldersHeader: {
