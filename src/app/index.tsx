@@ -27,7 +27,7 @@ import { databaseService } from '../services/databaseService';
 import { nativeAudioService } from '../services/nativeAudioService';
 import { offlineWakeWordService } from '../services/offlineWakeWordService';
 import { soundEffectsService } from '../services/soundEffectsService';
-import { speechRecognitionService } from '../services/speechRecognitionService';
+import { speechRecognitionService, SUGGESTED_WAKE_WORDS } from '../services/speechRecognitionService';
 import { transcriptionService } from '../services/transcriptionService';
 import { Note, NoteCategory, Student, SystemSettings, VoiceProfile, VoiceState } from '../types';
 
@@ -60,19 +60,27 @@ export default function App() {
   const [isWakeWordModalOpen, setIsWakeWordModalOpen] = useState(false);
   const [detailsStudent, setDetailsStudent] = useState<Student | null>(null);
 
-  // Carregar dados iniciais
+  // Carregar dados iniciais (hidratando do expo-sqlite e @react-native-async-storage/async-storage)
   useEffect(() => {
+    let isMounted = true;
     loadData();
-    databaseService.getSecureTranscriptionKey().then(() => {
-      setSettings(databaseService.getSettings());
+
+    databaseService.init().then(async () => {
+      if (!isMounted) return;
+      await databaseService.getSecureTranscriptionKey();
+      if (!isMounted) return;
+      loadData();
+
+      const saved = databaseService.getSettings();
+      if (saved.continuousListening) {
+        setTimeout(() => {
+          if (isMounted) startOfflineWakeWord();
+        }, 1000);
+      }
     });
-    const saved = databaseService.getSettings();
-    if (saved.continuousListening) {
-      setTimeout(() => {
-        startOfflineWakeWord();
-      }, 1000);
-    }
+
     return () => {
+      isMounted = false;
       offlineWakeWordService.stopListening();
     };
   }, []);
@@ -87,9 +95,12 @@ export default function App() {
     const profile = databaseService.getVoiceProfile();
     setVoiceProfile(profile);
 
-    // Seleciona o primeiro aluno se houver
-    if (loadedStudents.length > 0 && !selectedStudent) {
-      const active = loadedStudents.find((s) => s.id === savedSettings.selectedStudentId) || loadedStudents[0];
+    // Seleciona o aluno ativo salvo nas preferências ou o primeiro da lista
+    if (loadedStudents.length > 0) {
+      const active =
+        loadedStudents.find((s) => s.id === savedSettings.selectedStudentId) ||
+        (selectedStudent && loadedStudents.find((s) => s.id === selectedStudent.id)) ||
+        loadedStudents[0];
       setSelectedStudent(active);
     }
   };
@@ -143,6 +154,7 @@ export default function App() {
       const newSt = databaseService.createStudentFolder(cmd.studentName);
       setStudents(databaseService.getStudents());
       setSelectedStudent(newSt);
+      setSettings(databaseService.saveSettings({ selectedStudentId: newSt.id }));
       const msg = `Pasta criada para o aluno: ${newSt.name}!`;
       showToast(`📁 ${msg}`);
       soundEffectsService.speak(msg);
@@ -151,6 +163,7 @@ export default function App() {
       const found = databaseService.findStudentByName(cmd.studentName);
       if (found) {
         setSelectedStudent(found);
+        setSettings(databaseService.saveSettings({ selectedStudentId: found.id }));
         showToast(`Gravando anotação para ${found.name}`);
       }
     }
@@ -322,16 +335,17 @@ export default function App() {
     }
   };
 
-  // Disparo automático quando o usuário fala "Professora" offline
+  // Disparo automático quando o usuário fala uma das palavras-chave
   const handleWakeWordTriggered = async (word: string, confidence: number) => {
     soundEffectsService.playWakeWordChime();
-    showToast(`🎙️ "${word}" detectado offline (${confidence}%)! Gravando...`);
+    const displayWord = word ? word.charAt(0).toUpperCase() + word.slice(1) : 'Palavra-chave';
+    showToast(`🎙️ "${displayWord}" detectado (${confidence}%)! Gravando...`);
 
     // Pausa a escuta do wake word para liberar o microfone para a gravação da nota
     offlineWakeWordService.stopListening();
 
     setVoiceState('recording_dictation');
-    setTranscript('🎙️ "Professora" detectado! Fale sua anotação agora.\nToque no botão central para finalizar e transcrever.');
+    setTranscript(`🎙️ "${displayWord}" detectado! Fale sua anotação agora.\nToque no botão central para finalizar e transcrever.`);
 
     if (Platform.OS !== 'web') {
       try {
@@ -348,7 +362,7 @@ export default function App() {
     }
   };
 
-  // Alternar modo de escuta contínua por palavra-chave ("professora") 100% offline
+  // Alternar modo de escuta contínua por palavra-chave
   const handleToggleContinuousListening = async () => {
     const updated = !settings.continuousListening;
     const newSettings = databaseService.saveSettings({
@@ -359,7 +373,11 @@ export default function App() {
 
     if (updated) {
       await startOfflineWakeWord();
-      showToast('🟢 Escuta contínua offline ativada! Diga "Professora" para acionar.');
+      const promptWord =
+        !newSettings.wakeWord || newSettings.wakeWord === 'todas'
+          ? '"Professora", "Assistente", "Anotar" ou "Gravar"'
+          : `"${newSettings.wakeWord.charAt(0).toUpperCase() + newSettings.wakeWord.slice(1)}"`;
+      showToast(`🟢 Escuta contínua ativada! Diga ${promptWord} para acionar.`);
     } else {
       stopOfflineWakeWord();
       speechRecognitionService.stop();
@@ -387,7 +405,9 @@ export default function App() {
     const updatedList = databaseService.getStudents();
     setStudents(updatedList);
     setSelectedStudent(created);
-    showToast(`Pasta de ${created.name} criada!`);
+    const updatedSettings = databaseService.saveSettings({ selectedStudentId: created.id });
+    setSettings(updatedSettings);
+    showToast(`Pasta de ${created.name} criada no banco local!`);
   };
 
   // Deletar Aluno
@@ -503,7 +523,9 @@ export default function App() {
                 {isRecording
                   ? 'Gravando Ditado...'
                   : isListeningWakeWord
-                  ? 'Aguardando "Professora"'
+                  ? (!settings.wakeWord || settings.wakeWord === 'todas'
+                      ? 'Aguardando Palavra-Chave'
+                      : `Aguardando "${settings.wakeWord.charAt(0).toUpperCase() + settings.wakeWord.slice(1)}"`)
                   : 'Parado'}
               </Text>
             </View>
@@ -613,7 +635,9 @@ export default function App() {
                       : isRecording
                       ? 'Gravando... Fale sua anotação e toque no microfone para transcrever'
                       : isListeningWakeWord
-                      ? 'Aguardando palavra-chave "Professora"'
+                      ? (!settings.wakeWord || settings.wakeWord === 'todas'
+                          ? 'Aguardando palavra-chave ("Professora", "Assistente", "Anotar" ou "Gravar")'
+                          : `Aguardando palavra-chave "${settings.wakeWord.charAt(0).toUpperCase() + settings.wakeWord.slice(1)}"`)
                       : 'Toque para ditar ou ative a palavra-chave'}
                   </Text>
                 </View>
@@ -731,15 +755,58 @@ export default function App() {
 
                 {/* Palavras-chave e Comandos Rápidos */}
                 <View style={styles.commandsCard}>
-                  <Text style={styles.commandsTitle}>
-                    Palavras-chave de ativação automática:
-                  </Text>
+                  <View style={styles.commandsHeaderRow}>
+                    <Text style={styles.commandsTitle}>
+                      Palavras-chave de ativação automática:
+                    </Text>
+                    <TouchableOpacity
+                      onPress={() => setIsWakeWordModalOpen(true)}
+                      style={styles.adjustWakeWordsBtn}
+                    >
+                      <Ionicons name="options-outline" size={13} color="#15803d" />
+                      <Text style={styles.adjustWakeWordsText}>Ajustar</Text>
+                    </TouchableOpacity>
+                  </View>
                   <View style={styles.keywordsWrap}>
-                    {['"Professora"', '"Assistente"', '"Anotar"', '"Gravar"'].map((kw, i) => (
-                      <View key={i} style={styles.keywordBadge}>
-                        <Text style={styles.keywordText}>{kw}</Text>
-                      </View>
-                    ))}
+                    {SUGGESTED_WAKE_WORDS.map((item) => {
+                      const isSelected =
+                        settings.wakeWord === 'todas' ||
+                        !settings.wakeWord ||
+                        settings.wakeWord === item.key;
+                      return (
+                        <TouchableOpacity
+                          key={item.key}
+                          style={[
+                            styles.keywordBadge,
+                            isSelected && styles.keywordBadgeSelected,
+                          ]}
+                          onPress={() => {
+                            const newKey = settings.wakeWord === item.key ? 'todas' : item.key;
+                            const updated = databaseService.saveSettings({ wakeWord: newKey });
+                            setSettings(updated);
+                            showToast(
+                              newKey === 'todas'
+                                ? 'Todas as 4 palavras de ativação ativas!'
+                                : `Palavra de ativação: "${item.label}"!`
+                            );
+                          }}
+                        >
+                          <Ionicons
+                            name={isSelected ? 'mic' : 'mic-outline'}
+                            size={13}
+                            color={isSelected ? '#15803d' : '#64748b'}
+                          />
+                          <Text
+                            style={[
+                              styles.keywordText,
+                              isSelected && styles.keywordTextSelected,
+                            ]}
+                          >
+                            "{item.label}"
+                          </Text>
+                        </TouchableOpacity>
+                      );
+                    })}
                   </View>
 
                   <View style={styles.voiceCommandTips}>
@@ -790,7 +857,7 @@ export default function App() {
                     <View style={styles.wakeWordPillLeft}>
                       <Ionicons name="hardware-chip" size={15} color="#15803d" />
                       <Text style={styles.wakeWordSettingsPillText}>
-                        Wake Word Offline: "Professora" ({settings.wakeWordSensitivity === 'alta' ? 'Sensibilidade Alta' : settings.wakeWordSensitivity === 'baixa' ? 'Sensibilidade Baixa' : 'Sensibilidade Média'})
+                        Wake Word: {!settings.wakeWord || settings.wakeWord === 'todas' ? 'Todas (Professora, Assistente, Anotar, Gravar)' : `"${settings.wakeWord.charAt(0).toUpperCase() + settings.wakeWord.slice(1)}"`} ({settings.wakeWordSensitivity === 'alta' ? 'Sensibilidade Alta' : settings.wakeWordSensitivity === 'baixa' ? 'Sensibilidade Baixa' : 'Sensibilidade Média'})
                       </Text>
                     </View>
                     <Ionicons name="chevron-forward" size={15} color="#15803d" />
@@ -810,7 +877,7 @@ export default function App() {
                     <Text style={styles.cardTitle}>Pastas dos Alunos</Text>
                     <Text style={styles.cardSubtitle}>
                       {students.length} aluno{students.length !== 1 ? 's' : ''} cadastrado
-                      {students.length !== 1 ? 's' : ''}
+                      {students.length !== 1 ? 's' : ''} • Salvo no aparelho (SQLite + AsyncStorage)
                     </Text>
                   </View>
 
@@ -859,6 +926,8 @@ export default function App() {
                         isSelected={selectedStudent?.id === student.id}
                         onSelect={(st) => {
                           setSelectedStudent(st);
+                          const updated = databaseService.saveSettings({ selectedStudentId: st.id });
+                          setSettings(updated);
                           showToast(`Pasta de ${st.name} selecionada para ditado.`);
                         }}
                         onOpenDetails={(st) => {
@@ -1340,11 +1409,30 @@ const styles = StyleSheet.create({
     borderColor: '#bbf7d0',
     padding: 14,
   },
+  commandsHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
   commandsTitle: {
     fontSize: 12,
     fontWeight: '700',
     color: '#166534',
-    marginBottom: 8,
+  },
+  adjustWakeWordsBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: '#dcfce7',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+  },
+  adjustWakeWordsText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#15803d',
   },
   keywordsWrap: {
     flexDirection: 'row',
@@ -1353,17 +1441,28 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   keywordBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
     backgroundColor: '#fff',
     paddingHorizontal: 8,
-    paddingVertical: 3,
+    paddingVertical: 4,
     borderRadius: 6,
     borderWidth: 1,
-    borderColor: '#86efac',
+    borderColor: '#cbd5e1',
+  },
+  keywordBadgeSelected: {
+    backgroundColor: '#dcfce7',
+    borderColor: '#15803d',
   },
   keywordText: {
     fontSize: 11,
-    color: '#15803d',
+    color: '#475569',
     fontWeight: '600',
+  },
+  keywordTextSelected: {
+    color: '#15803d',
+    fontWeight: '700',
   },
   voiceCommandTips: {
     gap: 4,

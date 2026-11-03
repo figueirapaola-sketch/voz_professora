@@ -1,3 +1,6 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as SQLite from 'expo-sqlite';
+import { Platform } from 'react-native';
 import { Note, Student, SystemSettings, VoiceProfile } from '../types';
 import { secureStorageService } from './secureStorageService';
 
@@ -7,7 +10,10 @@ const STORAGE_KEYS = {
   VOICE_PROFILE: '@voz_professora_voice_profile_v1',
   SETTINGS: '@voz_professora_settings_v1',
   SECURE_KEY_CIPHER: '@voz_professora_sec_cipher_v1',
+  SQLITE_MIGRATED: '@voz_professora_sqlite_migrated_v1',
 };
+
+const SQLITE_DB_NAME = 'voz_professora.db';
 
 // Criptografia reversível local para garantir que a chave nunca seja salva em texto puro
 function encryptLocalSecret(plain: string): string {
@@ -41,13 +47,20 @@ function decryptLocalSecret(cipher: string): string {
   return dec;
 }
 
-// Memory fallback for non-browser environments
+// Memory fallback for non-browser / synchronous access before AsyncStorage finishes hydrating
 const memoryStorage: Record<string, string> = {};
 
 function safeGetItem(key: string): string | null {
+  if (memoryStorage[key] !== undefined) {
+    return memoryStorage[key];
+  }
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
-      return window.localStorage.getItem(key);
+      const val = window.localStorage.getItem(key);
+      if (val !== null) {
+        memoryStorage[key] = val;
+        return val;
+      }
     }
   } catch (e) {
     console.warn('Erro ao acessar localStorage:', e);
@@ -56,15 +69,18 @@ function safeGetItem(key: string): string | null {
 }
 
 function safeSetItem(key: string, value: string): void {
+  memoryStorage[key] = value;
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
       window.localStorage.setItem(key, value);
-      return;
     }
   } catch (e) {
     console.warn('Erro ao salvar no localStorage:', e);
   }
-  memoryStorage[key] = value;
+  // Persiste assincronamente no @react-native-async-storage/async-storage (Android, iOS e Web)
+  AsyncStorage.setItem(key, value).catch((err) => {
+    console.warn('[AsyncStorage] Erro ao persistir chave:', key, err);
+  });
 }
 
 const DEFAULT_AVATAR_COLORS = [
@@ -136,7 +152,7 @@ const INITIAL_NOTES: Note[] = [
 ];
 
 const DEFAULT_SETTINGS: SystemSettings = {
-  wakeWord: 'professora',
+  wakeWord: 'todas',
   silenceTimeoutSeconds: 10,
   speakConfirmation: true,
   continuousListening: false,
@@ -158,16 +174,323 @@ const DEFAULT_VOICE_PROFILE: VoiceProfile = {
   noiseFilterEnabled: true,
 };
 
+// ============================================================================
+// GERENCIAMENTO DO BANCO RELACIONAL LOCAL (EXPO-SQLITE) E CACHE EM MEMÓRIA
+// ============================================================================
+let sqliteDb: SQLite.SQLiteDatabase | null = null;
+let isStorageInitialized = false;
+let initPromise: Promise<void> | null = null;
+let cachedStudents: Student[] | null = null;
+let cachedNotes: Note[] | null = null;
+
+interface StudentRow {
+  id: string;
+  name: string;
+  grade: string | null;
+  avatarColor: string;
+  notesCount: number;
+  createdAt: string;
+}
+
+interface NoteRow {
+  id: string;
+  studentId: string;
+  studentName: string;
+  text: string;
+  category: string;
+  createdAt: string;
+  recordedViaVoice: number;
+  audioUri: string | null;
+  audioDurationSeconds: number | null;
+}
+
+function mapRowToStudent(row: StudentRow): Student {
+  return {
+    id: row.id,
+    name: row.name,
+    grade: row.grade || 'Turma Principal',
+    avatarColor: row.avatarColor || '#059669',
+    notesCount: Number(row.notesCount || 0),
+    createdAt: row.createdAt,
+  };
+}
+
+function mapRowToNote(row: NoteRow): Note {
+  return {
+    id: row.id,
+    studentId: row.studentId,
+    studentName: row.studentName,
+    text: row.text,
+    category: (row.category as Note['category']) || 'geral',
+    createdAt: row.createdAt,
+    recordedViaVoice: Boolean(row.recordedViaVoice),
+    audioUri: row.audioUri || undefined,
+    audioDurationSeconds:
+      row.audioDurationSeconds !== null && row.audioDurationSeconds !== undefined
+        ? Number(row.audioDurationSeconds)
+        : undefined,
+  };
+}
+
+/**
+ * Inicializa o banco SQLite de forma síncrona quando suportado (Android / iOS)
+ * para disponibilidade imediata desde o primeiro frame.
+ */
+function ensureSyncSQLiteReady(): SQLite.SQLiteDatabase | null {
+  if (sqliteDb) return sqliteDb;
+  if (Platform.OS === 'web') return null;
+
+  try {
+    const db = SQLite.openDatabaseSync(SQLITE_DB_NAME);
+    db.execSync(`
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE IF NOT EXISTS students (
+        id TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        grade TEXT,
+        avatarColor TEXT NOT NULL,
+        notesCount INTEGER NOT NULL DEFAULT 0,
+        createdAt TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS notes (
+        id TEXT PRIMARY KEY NOT NULL,
+        studentId TEXT NOT NULL,
+        studentName TEXT NOT NULL,
+        text TEXT NOT NULL,
+        category TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        recordedViaVoice INTEGER NOT NULL DEFAULT 1,
+        audioUri TEXT,
+        audioDurationSeconds REAL
+      );
+      CREATE INDEX IF NOT EXISTS idx_notes_studentId ON notes(studentId);
+    `);
+    sqliteDb = db;
+    return db;
+  } catch (err) {
+    console.warn('[SQLite] Falha na inicialização síncrona, usando fallback:', err);
+    return null;
+  }
+}
+
 export const databaseService = {
-  // --- ALUNOS / PASTAS ---
+  /**
+   * Inicializa e hidrata o armazenamento local do dispositivo:
+   * - `@react-native-async-storage/async-storage`: Preferências, configurações, perfil de voz e chaves.
+   * - `expo-sqlite`: Banco relacional local para pastas de alunos (`students`) e anotações (`notes`).
+   */
+  async init(): Promise<void> {
+    if (isStorageInitialized) return;
+    if (initPromise) return initPromise;
+
+    initPromise = (async () => {
+      try {
+        // 1. Hidrata chaves-valor do AsyncStorage para o cache rápido em memória
+        const keysToLoad = [
+          STORAGE_KEYS.SETTINGS,
+          STORAGE_KEYS.VOICE_PROFILE,
+          STORAGE_KEYS.SECURE_KEY_CIPHER,
+          STORAGE_KEYS.STUDENTS,
+          STORAGE_KEYS.NOTES,
+          STORAGE_KEYS.SQLITE_MIGRATED,
+        ];
+        const pairs = await AsyncStorage.multiGet(keysToLoad);
+        for (const [key, value] of pairs) {
+          if (value !== null) {
+            memoryStorage[key] = value;
+          }
+        }
+
+        // Inicializa o cofre seguro da chave de API
+        await secureStorageService.init();
+
+        // 2. Abre e configura o banco de dados relacional SQLite (expo-sqlite)
+        if (!sqliteDb) {
+          try {
+            const db = await SQLite.openDatabaseAsync(SQLITE_DB_NAME);
+            await db.execAsync(`
+              CREATE TABLE IF NOT EXISTS students (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                grade TEXT,
+                avatarColor TEXT NOT NULL,
+                notesCount INTEGER NOT NULL DEFAULT 0,
+                createdAt TEXT NOT NULL
+              );
+              CREATE TABLE IF NOT EXISTS notes (
+                id TEXT PRIMARY KEY NOT NULL,
+                studentId TEXT NOT NULL,
+                studentName TEXT NOT NULL,
+                text TEXT NOT NULL,
+                category TEXT NOT NULL,
+                createdAt TEXT NOT NULL,
+                recordedViaVoice INTEGER NOT NULL DEFAULT 1,
+                audioUri TEXT,
+                audioDurationSeconds REAL
+              );
+              CREATE INDEX IF NOT EXISTS idx_notes_studentId ON notes(studentId);
+            `);
+            sqliteDb = db;
+          } catch (sqliteErr) {
+            console.warn('[SQLite] openDatabaseAsync indisponível neste ambiente, usando AsyncStorage:', sqliteErr);
+          }
+        }
+
+        // 3. Verifica e popula/migra dados iniciais para o SQLite
+        if (sqliteDb) {
+          const existingStudents = await sqliteDb.getAllAsync<StudentRow>(
+            'SELECT * FROM students ORDER BY createdAt DESC'
+          );
+
+          if (existingStudents.length === 0) {
+            // Verifica se já existiam dados no AsyncStorage / localStorage para migrar
+            let seedStudents = INITIAL_STUDENTS;
+            let seedNotes = INITIAL_NOTES;
+
+            const legacyStudentsRaw = safeGetItem(STORAGE_KEYS.STUDENTS);
+            const legacyNotesRaw = safeGetItem(STORAGE_KEYS.NOTES);
+
+            if (legacyStudentsRaw) {
+              try {
+                const parsed = JSON.parse(legacyStudentsRaw);
+                if (Array.isArray(parsed) && parsed.length > 0) seedStudents = parsed;
+              } catch {
+                // ignore
+              }
+            }
+
+            if (legacyNotesRaw) {
+              try {
+                const parsed = JSON.parse(legacyNotesRaw);
+                if (Array.isArray(parsed) && parsed.length > 0) seedNotes = parsed;
+              } catch {
+                // ignore
+              }
+            }
+
+            for (const st of seedStudents) {
+              await sqliteDb.runAsync(
+                `INSERT OR REPLACE INTO students (id, name, grade, avatarColor, notesCount, createdAt)
+                 VALUES (?, ?, ?, ?, ?, ?)`,
+                st.id,
+                st.name,
+                st.grade || 'Turma Principal',
+                st.avatarColor || '#059669',
+                st.notesCount || 0,
+                st.createdAt
+              );
+            }
+
+            for (const nt of seedNotes) {
+              await sqliteDb.runAsync(
+                `INSERT OR REPLACE INTO notes (id, studentId, studentName, text, category, createdAt, recordedViaVoice, audioUri, audioDurationSeconds)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                nt.id,
+                nt.studentId,
+                nt.studentName,
+                nt.text,
+                nt.category || 'geral',
+                nt.createdAt,
+                nt.recordedViaVoice ? 1 : 0,
+                nt.audioUri ?? null,
+                nt.audioDurationSeconds ?? null
+              );
+            }
+
+            safeSetItem(STORAGE_KEYS.SQLITE_MIGRATED, 'true');
+          }
+
+          const finalStudents = await sqliteDb.getAllAsync<StudentRow>(
+            'SELECT * FROM students ORDER BY createdAt DESC'
+          );
+          const finalNotes = await sqliteDb.getAllAsync<NoteRow>(
+            'SELECT * FROM notes ORDER BY createdAt DESC'
+          );
+
+          cachedStudents = finalStudents.map(mapRowToStudent);
+          cachedNotes = finalNotes.map(mapRowToNote);
+
+          // Mantém espelho atualizado no AsyncStorage para redundância offline
+          safeSetItem(STORAGE_KEYS.STUDENTS, JSON.stringify(cachedStudents));
+          safeSetItem(STORAGE_KEYS.NOTES, JSON.stringify(cachedNotes));
+        } else {
+          // Fallback caso WebAssembly do SQLite não esteja ativo no navegador
+          cachedStudents = this.getStudents();
+          cachedNotes = this.getNotes();
+        }
+      } catch (e) {
+        console.warn('[DatabaseService] Erro ao inicializar armazenamento local:', e);
+      } finally {
+        isStorageInitialized = true;
+      }
+    })();
+
+    return initPromise;
+  },
+
+  /**
+   * Retorna informações diagnósticas sobre os motores de armazenamento local ativos.
+   */
+  getLocalStorageEnginesInfo(): {
+    relationalDb: string;
+    keyValueStorage: string;
+    secureHardware: string;
+  } {
+    return {
+      relationalDb: sqliteDb
+        ? 'Expo SQLite (voz_professora.db • Tabelas: students, notes)'
+        : 'AsyncStorage Fallback Relacional',
+      keyValueStorage: '@react-native-async-storage/async-storage (Preferências & Perfil)',
+      secureHardware: secureStorageService.getSecurityLabel(),
+    };
+  },
+
+  // --- ALUNOS / PASTAS (EXPO-SQLITE + ASYNCSTORAGE) ---
   getStudents(): Student[] {
+    if (cachedStudents) {
+      return cachedStudents;
+    }
+
+    const db = ensureSyncSQLiteReady();
+    if (db) {
+      try {
+        const rows = db.getAllSync<StudentRow>('SELECT * FROM students ORDER BY createdAt DESC');
+        if (rows.length > 0) {
+          cachedStudents = rows.map(mapRowToStudent);
+          return cachedStudents;
+        }
+      } catch (e) {
+        console.warn('[SQLite] Erro ao ler alunos sincronamente:', e);
+      }
+    }
+
     const raw = safeGetItem(STORAGE_KEYS.STUDENTS);
     if (!raw) {
+      cachedStudents = INITIAL_STUDENTS;
       safeSetItem(STORAGE_KEYS.STUDENTS, JSON.stringify(INITIAL_STUDENTS));
+      if (db) {
+        try {
+          for (const st of INITIAL_STUDENTS) {
+            db.runSync(
+              `INSERT OR REPLACE INTO students (id, name, grade, avatarColor, notesCount, createdAt)
+               VALUES (?, ?, ?, ?, ?, ?)`,
+              st.id,
+              st.name,
+              st.grade || 'Turma Principal',
+              st.avatarColor || '#059669',
+              st.notesCount || 0,
+              st.createdAt
+            );
+          }
+        } catch {
+          // ignore
+        }
+      }
       return INITIAL_STUDENTS;
     }
     try {
-      return JSON.parse(raw);
+      cachedStudents = JSON.parse(raw);
+      return cachedStudents || INITIAL_STUDENTS;
     } catch {
       return INITIAL_STUDENTS;
     }
@@ -204,31 +527,106 @@ export const databaseService = {
     };
 
     const updated = [newStudent, ...students];
+    cachedStudents = updated;
     safeSetItem(STORAGE_KEYS.STUDENTS, JSON.stringify(updated));
+
+    // Persiste no banco relacional local (expo-sqlite)
+    const db = ensureSyncSQLiteReady();
+    if (db) {
+      db.runAsync(
+        `INSERT OR REPLACE INTO students (id, name, grade, avatarColor, notesCount, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        newStudent.id,
+        newStudent.name,
+        newStudent.grade || 'Turma Principal',
+        newStudent.avatarColor,
+        newStudent.notesCount,
+        newStudent.createdAt
+      ).catch((err) => console.warn('[SQLite] Erro ao inserir aluno:', err));
+    }
+
     return newStudent;
   },
 
   deleteStudentFolder(studentId: string): void {
     const students = this.getStudents().filter(s => s.id !== studentId);
+    cachedStudents = students;
     safeSetItem(STORAGE_KEYS.STUDENTS, JSON.stringify(students));
 
     // Also delete notes for this student
     const notes = this.getNotes().filter(n => n.studentId !== studentId);
+    cachedNotes = notes;
     safeSetItem(STORAGE_KEYS.NOTES, JSON.stringify(notes));
+
+    // Remove do banco relacional local (expo-sqlite)
+    const db = ensureSyncSQLiteReady();
+    if (db) {
+      db.runAsync('DELETE FROM students WHERE id = ?', studentId).catch((err) =>
+        console.warn('[SQLite] Erro ao excluir aluno:', err)
+      );
+      db.runAsync('DELETE FROM notes WHERE studentId = ?', studentId).catch((err) =>
+        console.warn('[SQLite] Erro ao excluir notas do aluno:', err)
+      );
+    }
   },
 
-  // --- ANOTAÇÕES ---
+  // --- ANOTAÇÕES (EXPO-SQLITE + ASYNCSTORAGE) ---
   getNotes(studentId?: string): Note[] {
-    const raw = safeGetItem(STORAGE_KEYS.NOTES);
-    let notes: Note[] = [];
-    if (!raw) {
-      safeSetItem(STORAGE_KEYS.NOTES, JSON.stringify(INITIAL_NOTES));
-      notes = INITIAL_NOTES;
+    let notes: Note[];
+
+    if (cachedNotes) {
+      notes = cachedNotes;
     } else {
-      try {
-        notes = JSON.parse(raw);
-      } catch {
-        notes = INITIAL_NOTES;
+      const db = ensureSyncSQLiteReady();
+      let loadedFromDb: Note[] | null = null;
+      if (db) {
+        try {
+          const rows = db.getAllSync<NoteRow>('SELECT * FROM notes ORDER BY createdAt DESC');
+          if (rows.length > 0) {
+            loadedFromDb = rows.map(mapRowToNote);
+          }
+        } catch (e) {
+          console.warn('[SQLite] Erro ao ler notas sincronamente:', e);
+        }
+      }
+
+      if (loadedFromDb) {
+        notes = loadedFromDb;
+        cachedNotes = notes;
+      } else {
+        const raw = safeGetItem(STORAGE_KEYS.NOTES);
+        if (!raw) {
+          safeSetItem(STORAGE_KEYS.NOTES, JSON.stringify(INITIAL_NOTES));
+          notes = INITIAL_NOTES;
+          if (db) {
+            try {
+              for (const nt of INITIAL_NOTES) {
+                db.runSync(
+                  `INSERT OR REPLACE INTO notes (id, studentId, studentName, text, category, createdAt, recordedViaVoice, audioUri, audioDurationSeconds)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  nt.id,
+                  nt.studentId,
+                  nt.studentName,
+                  nt.text,
+                  nt.category || 'geral',
+                  nt.createdAt,
+                  nt.recordedViaVoice ? 1 : 0,
+                  nt.audioUri ?? null,
+                  nt.audioDurationSeconds ?? null
+                );
+              }
+            } catch {
+              // ignore
+            }
+          }
+        } else {
+          try {
+            notes = JSON.parse(raw);
+          } catch {
+            notes = INITIAL_NOTES;
+          }
+        }
+        cachedNotes = notes;
       }
     }
 
@@ -261,16 +659,44 @@ export const databaseService = {
     };
 
     const updatedNotes = [newNote, ...notes];
+    cachedNotes = updatedNotes;
     safeSetItem(STORAGE_KEYS.NOTES, JSON.stringify(updatedNotes));
 
     // Update student's notesCount
+    let updatedCount = 1;
     const students = this.getStudents().map(s => {
       if (s.id === studentId) {
-        return { ...s, notesCount: (s.notesCount || 0) + 1 };
+        updatedCount = (s.notesCount || 0) + 1;
+        return { ...s, notesCount: updatedCount };
       }
       return s;
     });
+    cachedStudents = students;
     safeSetItem(STORAGE_KEYS.STUDENTS, JSON.stringify(students));
+
+    // Salva no banco relacional local (expo-sqlite)
+    const db = ensureSyncSQLiteReady();
+    if (db) {
+      db.runAsync(
+        `INSERT OR REPLACE INTO notes (id, studentId, studentName, text, category, createdAt, recordedViaVoice, audioUri, audioDurationSeconds)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        newNote.id,
+        newNote.studentId,
+        newNote.studentName,
+        newNote.text,
+        newNote.category,
+        newNote.createdAt,
+        newNote.recordedViaVoice ? 1 : 0,
+        newNote.audioUri ?? null,
+        newNote.audioDurationSeconds ?? null
+      ).catch((err) => console.warn('[SQLite] Erro ao inserir anotação:', err));
+
+      db.runAsync(
+        'UPDATE students SET notesCount = ? WHERE id = ?',
+        updatedCount,
+        studentId
+      ).catch((err) => console.warn('[SQLite] Erro ao atualizar contador de notas do aluno:', err));
+    }
 
     return newNote;
   },
@@ -279,36 +705,64 @@ export const databaseService = {
     const notes = this.getNotes();
     const target = notes.find(n => n.id === noteId);
     const updated = notes.filter(n => n.id !== noteId);
+    cachedNotes = updated;
     safeSetItem(STORAGE_KEYS.NOTES, JSON.stringify(updated));
 
+    let newCount = 0;
     if (target) {
       const students = this.getStudents().map(s => {
         if (s.id === target.studentId) {
-          return { ...s, notesCount: Math.max(0, (s.notesCount || 1) - 1) };
+          newCount = Math.max(0, (s.notesCount || 1) - 1);
+          return { ...s, notesCount: newCount };
         }
         return s;
       });
+      cachedStudents = students;
       safeSetItem(STORAGE_KEYS.STUDENTS, JSON.stringify(students));
+    }
+
+    // Remove do banco relacional local (expo-sqlite)
+    const db = ensureSyncSQLiteReady();
+    if (db) {
+      db.runAsync('DELETE FROM notes WHERE id = ?', noteId).catch((err) =>
+        console.warn('[SQLite] Erro ao deletar anotação:', err)
+      );
+      if (target) {
+        db.runAsync(
+          'UPDATE students SET notesCount = ? WHERE id = ?',
+          newCount,
+          target.studentId
+        ).catch((err) => console.warn('[SQLite] Erro ao atualizar contador após exclusão:', err));
+      }
     }
   },
 
   updateNoteText(noteId: string, newText: string): Note | null {
     const notes = this.getNotes();
     let updatedNote: Note | null = null;
+    const cleanText = newText.trim();
     const updatedNotes = notes.map((n) => {
       if (n.id === noteId) {
-        updatedNote = { ...n, text: newText.trim() };
+        updatedNote = { ...n, text: cleanText };
         return updatedNote;
       }
       return n;
     });
     if (updatedNote) {
+      cachedNotes = updatedNotes;
       safeSetItem(STORAGE_KEYS.NOTES, JSON.stringify(updatedNotes));
+
+      const db = ensureSyncSQLiteReady();
+      if (db) {
+        db.runAsync('UPDATE notes SET text = ? WHERE id = ?', cleanText, noteId).catch((err) =>
+          console.warn('[SQLite] Erro ao atualizar texto da anotação:', err)
+        );
+      }
     }
     return updatedNote;
   },
 
-  // --- PERFIL DE VOZ DA PROFESSORA ---
+  // --- PERFIL DE VOZ DA PROFESSORA (ASYNCSTORAGE) ---
   getVoiceProfile(): VoiceProfile {
     const raw = safeGetItem(STORAGE_KEYS.VOICE_PROFILE);
     if (!raw) return DEFAULT_VOICE_PROFILE;
@@ -323,7 +777,7 @@ export const databaseService = {
     safeSetItem(STORAGE_KEYS.VOICE_PROFILE, JSON.stringify(profile));
   },
 
-  // --- CONFIGURAÇÕES & ARMAZENAMENTO SEGURO ---
+  // --- CONFIGURAÇÕES & ARMAZENAMENTO SEGURO (ASYNCSTORAGE + SECURESTORE) ---
   getSettings(): SystemSettings {
     const raw = safeGetItem(STORAGE_KEYS.SETTINGS);
     let settings: SystemSettings = { ...DEFAULT_SETTINGS };
@@ -362,7 +816,7 @@ export const databaseService = {
 
     const secureKey = this.getSecureTranscriptionKeySync();
 
-    // Sanitiza para NUNCA salvar a chave em texto puro no JSON do banco/localStorage
+    // Sanitiza para NUNCA salvar a chave em texto puro no JSON do AsyncStorage/localStorage
     const toPersist: Partial<SystemSettings> = { ...current, ...settings };
     const sanitizedToPersist = { ...toPersist };
     delete sanitizedToPersist.transcriptionApiKey;

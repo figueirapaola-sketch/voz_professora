@@ -26,6 +26,40 @@ interface IWindowSpeechRecognition extends EventTarget {
   onstart: (() => void) | null;
 }
 
+export interface WakeWordConfig {
+  key: 'professora' | 'assistente' | 'anotar' | 'gravar';
+  label: string;
+  description: string;
+  aliases: string[];
+}
+
+export const SUGGESTED_WAKE_WORDS: WakeWordConfig[] = [
+  {
+    key: 'professora',
+    label: 'Professora',
+    description: 'Comando acolhedor e natural para o ambiente escolar',
+    aliases: ['professora', 'ei professora', 'oi professora', 'olá professora', 'profe', 'prof'],
+  },
+  {
+    key: 'assistente',
+    label: 'Assistente',
+    description: 'Estilo assistente inteligente',
+    aliases: ['assistente', 'ei assistente', 'oi assistente', 'olá assistente', 'assistente de voz'],
+  },
+  {
+    key: 'anotar',
+    label: 'Anotar',
+    description: 'Comando ágil para registro imediato',
+    aliases: ['anotar', 'anota', 'anote', 'anotar aí', 'anota aí', 'anote aí', 'anotação', 'anotar para', 'anota para', 'anote para'],
+  },
+  {
+    key: 'gravar',
+    label: 'Gravar',
+    description: 'Inicia a gravação direta por voz',
+    aliases: ['gravar', 'grava', 'grave', 'iniciar gravação', 'gravar áudio', 'gravar voz', 'gravar para', 'grava para'],
+  },
+];
+
 class SpeechRecognitionService {
   private recognition: IWindowSpeechRecognition | null = null;
   private state: VoiceState = 'idle';
@@ -37,8 +71,23 @@ class SpeechRecognitionService {
   private isUserInitiatedStop = false;
   private restartTimeout: any = null;
 
-  // Wake words aceitas
-  private wakeWords = ['professora', 'assistente', 'anotar', 'gravar', 'caderno', 'ei professora'];
+  /**
+   * Retorna os aliases da(s) palavra(s)-chave ativa(s) no momento (baseado nas configurações).
+   */
+  public getActiveWakeWords(): string[] {
+    const settings = databaseService.getSettings();
+    const chosen = (settings.wakeWord || 'todas').toLowerCase().trim();
+
+    if (chosen !== 'todas') {
+      const match = SUGGESTED_WAKE_WORDS.find((w) => w.key === chosen);
+      if (match) {
+        return match.aliases;
+      }
+    }
+
+    // Se 'todas' ou não especificado, aceita todas as 4 palavras sugeridas
+    return SUGGESTED_WAKE_WORDS.flatMap((w) => w.aliases);
+  }
 
   constructor() {
     this.initRecognition();
@@ -278,14 +327,32 @@ class SpeechRecognitionService {
         return;
       }
 
-      // Verificação de palavra-chave ("professora", "assistente", etc.)
-      const matchedWakeWord = this.wakeWords.find((w) => spokenText.includes(w));
+      // Comando de anotação direta: "Anotar para [Nome]: [Conteúdo]"
+      if (parsedCommand.type === 'dictate_to_student') {
+        soundEffectsService.playWakeWordChime();
+        this.callbacks?.onVoiceCommand(parsedCommand);
+        this.setState('recording_dictation');
+        if (parsedCommand.content) {
+          this.currentTranscript = parsedCommand.content + ' ';
+          this.callbacks?.onTranscriptChange(this.currentTranscript, false);
+        }
+        this.resetSilenceCountdown();
+        return;
+      }
+
+      // Verificação de palavra-chave ativa ("professora", "assistente", "anotar", "gravar")
+      const activeWakeWords = this.getActiveWakeWords();
+      // Ordena por comprimento decrescente para priorizar expressões mais longas ("ei professora" antes de "professora")
+      const sortedWakeWords = [...activeWakeWords].sort((a, b) => b.length - a.length);
+      const matchedWakeWord = sortedWakeWords.find((w) => spokenText.includes(w));
+
       if (matchedWakeWord) {
         soundEffectsService.playWakeWordChime();
         this.setState('recording_dictation');
 
         // Extrai o conteúdo após a palavra-chave se já tiver falado junto
-        const afterWakeWord = spokenText.split(matchedWakeWord)[1] || '';
+        const parts = spokenText.split(matchedWakeWord);
+        const afterWakeWord = (parts.slice(1).join(matchedWakeWord) || '').trim();
         const commandAfter = this.parseVoiceCommand(afterWakeWord);
 
         if (commandAfter.type === 'create_folder' || commandAfter.type === 'dictate_to_student') {
@@ -294,8 +361,8 @@ class SpeechRecognitionService {
             this.currentTranscript = commandAfter.content + ' ';
             this.callbacks?.onTranscriptChange(this.currentTranscript, false);
           }
-        } else if (afterWakeWord.trim()) {
-          this.currentTranscript = afterWakeWord.trim() + ' ';
+        } else if (afterWakeWord) {
+          this.currentTranscript = afterWakeWord + ' ';
           this.callbacks?.onTranscriptChange(this.currentTranscript, false);
         }
 
@@ -359,8 +426,8 @@ class SpeechRecognitionService {
       };
     }
 
-    // Comando 3: "Anotar para [Nome]: [Conteúdo]"
-    const dictateToStudentRegex = /(?:anotar para|observação para|anote para|pasta d[eoa])\s+([a-zA-ZáàâãéèêíïóôõöúçñÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ]+)(?:\s*:\s*|\s+)(.*)/i;
+    // Comando 3: "Anotar para [Nome]: [Conteúdo]" ou "Gravar para [Nome]: [Conteúdo]" ou "Para [Nome]: [Conteúdo]"
+    const dictateToStudentRegex = /(?:anotar para|observação para|anote para|anota para|gravar para|grave para|grava para|pasta d[eoa]|para)\s+([a-zA-ZáàâãéèêíïóôõöúçñÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ]+)(?:\s*:\s*|\s+)(.*)/i;
     const matchDictate = clean.match(dictateToStudentRegex);
     if (matchDictate && matchDictate[1]) {
       return {

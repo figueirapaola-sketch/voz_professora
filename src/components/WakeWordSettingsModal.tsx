@@ -3,6 +3,7 @@ import React, { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Modal,
+  ScrollView,
   StyleSheet,
   Switch,
   Text,
@@ -12,6 +13,7 @@ import {
 import { databaseService } from '../services/databaseService';
 import { offlineWakeWordService, WakeWordMetrics, WakeWordState } from '../services/offlineWakeWordService';
 import { soundEffectsService } from '../services/soundEffectsService';
+import { SUGGESTED_WAKE_WORDS } from '../services/speechRecognitionService';
 import { SystemSettings } from '../types';
 
 interface WakeWordSettingsModalProps {
@@ -46,6 +48,13 @@ export const WakeWordSettingsModal: React.FC<WakeWordSettingsModalProps> = ({
       }
     }
   }, [visible]);
+
+  // Salva alteração de palavra de ativação
+  const handleSelectWakeWord = (word: string) => {
+    const updated = databaseService.saveSettings({ wakeWord: word });
+    setSettings(updated);
+    onSettingsUpdated(updated);
+  };
 
   // Salva alteração de sensibilidade
   const handleSelectSensitivity = (sens: 'baixa' | 'media' | 'alta') => {
@@ -88,6 +97,14 @@ export const WakeWordSettingsModal: React.FC<WakeWordSettingsModalProps> = ({
     }
   };
 
+  const getWakeWordPrompt = () => {
+    if (!settings.wakeWord || settings.wakeWord === 'todas') {
+      return '"Professora", "Assistente", "Anotar" ou "Gravar"';
+    }
+    const match = SUGGESTED_WAKE_WORDS.find((w) => w.key === settings.wakeWord);
+    return `"${match ? match.label : 'Professora'}"`;
+  };
+
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
       <View style={styles.modalOverlay}>
@@ -116,140 +133,227 @@ export const WakeWordSettingsModal: React.FC<WakeWordSettingsModalProps> = ({
             </Text>
           </View>
 
-          {/* Card Ativar Escuta */}
-          <View style={styles.toggleCard}>
-            <View style={{ flex: 1, marginRight: 10 }}>
-              <Text style={styles.toggleCardTitle}>Escuta Contínua Ativa</Text>
-              <Text style={styles.toggleCardDesc}>
-                O aplicativo escuta continuamente em segundo plano pela palavra{' '}
-                <Text style={{ fontWeight: '700', color: '#15803d' }}>"Professora"</Text>.
-              </Text>
-            </View>
-            <Switch
-              value={!!settings.continuousListening}
-              onValueChange={handleToggleWakeWord}
-              trackColor={{ false: '#cbd5e1', true: '#86efac' }}
-              thumbColor={settings.continuousListening ? '#15803d' : '#f8fafc'}
-            />
-          </View>
-
-          {/* Seletor de Sensibilidade */}
-          <View style={styles.sectionContainer}>
-            <Text style={styles.sectionTitle}>Sensibilidade de Detecção</Text>
-            <Text style={styles.sectionSubtitle}>
-              Ajuste para equilibrar o ambiente da sua sala de aula
-            </Text>
-
-            <View style={styles.sensitivityRow}>
-              {(['baixa', 'media', 'alta'] as const).map((sens) => {
-                const isSelected = (settings.wakeWordSensitivity || 'media') === sens;
-                const labels = {
-                  baixa: 'Baixa\n(Anti-ruído)',
-                  media: 'Média\n(Recomendada)',
-                  alta: 'Alta\n(Mais sensível)',
-                };
-                return (
-                  <TouchableOpacity
-                    key={sens}
-                    style={[
-                      styles.sensBtn,
-                      isSelected && styles.sensBtnActive,
-                    ]}
-                    onPress={() => handleSelectSensitivity(sens)}
-                  >
-                    <Ionicons
-                      name={isSelected ? 'radio-button-on' : 'radio-button-off'}
-                      size={16}
-                      color={isSelected ? '#15803d' : '#64748b'}
-                    />
-                    <Text
-                      style={[
-                        styles.sensBtnText,
-                        isSelected && styles.sensBtnTextActive,
-                      ]}
-                    >
-                      {labels[sens]}
-                    </Text>
-                  </TouchableOpacity>
-                );
-              })}
-            </View>
-          </View>
-
-          {/* Teste Interativo em Tempo Real */}
-          <View style={styles.testSection}>
-            <View style={styles.testHeaderRow}>
-              <Text style={styles.testTitle}>Teste de Voz em Tempo Real</Text>
-              <TouchableOpacity
-                style={[styles.testBtn, isTesting && styles.testBtnActive]}
-                onPress={handleToggleTest}
-              >
-                <Ionicons
-                  name={isTesting ? 'stop-circle' : 'play-circle'}
-                  size={16}
-                  color="#fff"
-                />
-                <Text style={styles.testBtnText}>
-                  {isTesting ? 'Parar Teste' : 'Testar Agora'}
+          <ScrollView style={styles.scrollArea} showsVerticalScrollIndicator={false}>
+            {/* Card Ativar Escuta */}
+            <View style={styles.toggleCard}>
+              <View style={{ flex: 1, marginRight: 10 }}>
+                <Text style={styles.toggleCardTitle}>Escuta Contínua Ativa</Text>
+                <Text style={styles.toggleCardDesc}>
+                  O aplicativo escuta continuamente em segundo plano por{' '}
+                  <Text style={{ fontWeight: '700', color: '#15803d' }}>
+                    {getWakeWordPrompt()}
+                  </Text>.
                 </Text>
-              </TouchableOpacity>
+              </View>
+              <Switch
+                value={!!settings.continuousListening}
+                onValueChange={handleToggleWakeWord}
+                trackColor={{ false: '#cbd5e1', true: '#86efac' }}
+                thumbColor={settings.continuousListening ? '#15803d' : '#f8fafc'}
+              />
             </View>
 
-            {isTesting ? (
-              <View style={styles.testActiveBox}>
-                <View style={styles.liveVolumeRow}>
-                  <Ionicons name="mic" size={18} color="#15803d" />
-                  <Text style={styles.liveText}>
-                    Diga claramente:{' '}
-                    <Text style={{ fontWeight: '700', color: '#15803d' }}>
-                      "Professora"
-                    </Text>
-                  </Text>
-                  <Text style={styles.dbText}>{testMetrics.volumeDb} dB</Text>
-                </View>
+            {/* Seletor de Palavras de Ativação Sugeridas */}
+            <View style={styles.sectionContainer}>
+              <Text style={styles.sectionTitle}>Palavra de Ativação Sugerida</Text>
+              <Text style={styles.sectionSubtitle}>
+                Escolha a palavra que ativará o aplicativo ou deixe todas ativas
+              </Text>
 
-                {/* Barra de volume em tempo real */}
-                <View style={styles.volumeBarBg}>
-                  <View
-                    style={[
-                      styles.volumeBarFill,
-                      {
-                        width: `${Math.min(
-                          100,
-                          Math.max(5, ((testMetrics.volumeDb + 70) / 70) * 100)
-                        )}%`,
-                      },
-                    ]}
-                  />
-                </View>
-
-                {testDetection ? (
-                  <View style={styles.detectedSuccessBox}>
-                    <Ionicons name="checkmark-circle" size={24} color="#16a34a" />
-                    <View style={{ marginLeft: 8 }}>
-                      <Text style={styles.detectedTitle}>
-                        Palavra "Professora" Reconhecida!
+              <View style={styles.wakeWordOptionList}>
+                {/* Opção Todas */}
+                <TouchableOpacity
+                  style={[
+                    styles.wakeWordOptionBtn,
+                    (settings.wakeWord === 'todas' || !settings.wakeWord) &&
+                      styles.wakeWordOptionBtnActive,
+                  ]}
+                  onPress={() => handleSelectWakeWord('todas')}
+                >
+                  <View style={{ flex: 1 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <Text
+                        style={[
+                          styles.wakeWordOptionLabel,
+                          (settings.wakeWord === 'todas' || !settings.wakeWord) &&
+                            styles.wakeWordOptionLabelActive,
+                        ]}
+                      >
+                        Todas as 4 Palavras
                       </Text>
-                      <Text style={styles.detectedDesc}>
-                        Confiança: {testDetection.score}% • Reconhecido 100% offline
+                      <View style={styles.recommendedBadge}>
+                        <Text style={styles.recommendedBadgeText}>Recomendado</Text>
+                      </View>
+                    </View>
+                    <Text style={styles.wakeWordOptionDesc}>
+                      Reconhece "Professora", "Assistente", "Anotar" ou "Gravar"
+                    </Text>
+                  </View>
+                  <Ionicons
+                    name={
+                      settings.wakeWord === 'todas' || !settings.wakeWord
+                        ? 'checkmark-circle'
+                        : 'ellipse-outline'
+                    }
+                    size={20}
+                    color={
+                      settings.wakeWord === 'todas' || !settings.wakeWord ? '#15803d' : '#94a3b8'
+                    }
+                  />
+                </TouchableOpacity>
+
+                {/* As 4 Palavras Sugeridas Individuais */}
+                {SUGGESTED_WAKE_WORDS.map((item) => {
+                  const isSelected = settings.wakeWord === item.key;
+                  return (
+                    <TouchableOpacity
+                      key={item.key}
+                      style={[
+                        styles.wakeWordOptionBtn,
+                        isSelected && styles.wakeWordOptionBtnActive,
+                      ]}
+                      onPress={() => handleSelectWakeWord(item.key)}
+                    >
+                      <View style={{ flex: 1 }}>
+                        <Text
+                          style={[
+                            styles.wakeWordOptionLabel,
+                            isSelected && styles.wakeWordOptionLabelActive,
+                          ]}
+                        >
+                          "{item.label}"
+                        </Text>
+                        <Text style={styles.wakeWordOptionDesc}>{item.description}</Text>
+                      </View>
+                      <Ionicons
+                        name={isSelected ? 'checkmark-circle' : 'ellipse-outline'}
+                        size={20}
+                        color={isSelected ? '#15803d' : '#94a3b8'}
+                      />
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            </View>
+
+            {/* Seletor de Sensibilidade */}
+            <View style={styles.sectionContainer}>
+              <Text style={styles.sectionTitle}>Sensibilidade de Detecção</Text>
+              <Text style={styles.sectionSubtitle}>
+                Ajuste para equilibrar o ambiente da sua sala de aula
+              </Text>
+
+              <View style={styles.sensitivityRow}>
+                {(['baixa', 'media', 'alta'] as const).map((sens) => {
+                  const isSelected = (settings.wakeWordSensitivity || 'media') === sens;
+                  const labels = {
+                    baixa: 'Baixa\n(Anti-ruído)',
+                    media: 'Média\n(Recomendada)',
+                    alta: 'Alta\n(Mais sensível)',
+                  };
+                  return (
+                    <TouchableOpacity
+                      key={sens}
+                      style={[
+                        styles.sensBtn,
+                        isSelected && styles.sensBtnActive,
+                      ]}
+                      onPress={() => handleSelectSensitivity(sens)}
+                    >
+                      <Ionicons
+                        name={isSelected ? 'radio-button-on' : 'radio-button-off'}
+                        size={16}
+                        color={isSelected ? '#15803d' : '#64748b'}
+                      />
+                      <Text
+                        style={[
+                          styles.sensBtnText,
+                          isSelected && styles.sensBtnTextActive,
+                        ]}
+                      >
+                        {labels[sens]}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            </View>
+
+            {/* Teste Interativo em Tempo Real */}
+            <View style={styles.testSection}>
+              <View style={styles.testHeaderRow}>
+                <Text style={styles.testTitle}>Teste de Voz em Tempo Real</Text>
+                <TouchableOpacity
+                  style={[styles.testBtn, isTesting && styles.testBtnActive]}
+                  onPress={handleToggleTest}
+                >
+                  <Ionicons
+                    name={isTesting ? 'stop-circle' : 'play-circle'}
+                    size={16}
+                    color="#fff"
+                  />
+                  <Text style={styles.testBtnText}>
+                    {isTesting ? 'Parar Teste' : 'Testar Agora'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+
+              {isTesting ? (
+                <View style={styles.testActiveBox}>
+                  <View style={styles.liveVolumeRow}>
+                    <Ionicons name="mic" size={18} color="#15803d" />
+                    <Text style={styles.liveText}>
+                      Diga claramente:{' '}
+                      <Text style={{ fontWeight: '700', color: '#15803d' }}>
+                        {getWakeWordPrompt()}
+                      </Text>
+                    </Text>
+                    <Text style={styles.dbText}>{testMetrics.volumeDb} dB</Text>
+                  </View>
+
+                  {/* Barra de volume em tempo real */}
+                  <View style={styles.volumeBarBg}>
+                    <View
+                      style={[
+                        styles.volumeBarFill,
+                        {
+                          width: `${Math.min(
+                            100,
+                            Math.max(5, ((testMetrics.volumeDb + 70) / 70) * 100)
+                          )}%`,
+                        },
+                      ]}
+                    />
+                  </View>
+
+                  {testDetection ? (
+                    <View style={styles.detectedSuccessBox}>
+                      <Ionicons name="checkmark-circle" size={24} color="#16a34a" />
+                      <View style={{ marginLeft: 8, flex: 1 }}>
+                        <Text style={styles.detectedTitle}>
+                          Palavra "{testDetection.word ? testDetection.word.toUpperCase() : 'PROFESSORA'}" Reconhecida!
+                        </Text>
+                        <Text style={styles.detectedDesc}>
+                          Confiança: {testDetection.score}% • Reconhecido 100% offline
+                        </Text>
+                      </View>
+                    </View>
+                  ) : (
+                    <View style={styles.waitingDetectionBox}>
+                      <ActivityIndicator size="small" color="#15803d" />
+                      <Text style={styles.waitingText}>
+                        Aguardando você falar {getWakeWordPrompt()}...
                       </Text>
                     </View>
-                  </View>
-                ) : (
-                  <View style={styles.waitingDetectionBox}>
-                    <ActivityIndicator size="small" color="#15803d" />
-                    <Text style={styles.waitingText}>
-                      Aguardando você falar a palavra-chave...
-                    </Text>
-                  </View>
-                )}
-              </View>
-            ) : (
-              <Text style={styles.testTip}>
-                Toque em "Testar Agora" e fale "Professora" para verificar a detecção no seu microfone.
-              </Text>
-            )}
-          </View>
+                  )}
+                </View>
+              ) : (
+                <Text style={styles.testTip}>
+                  Toque em "Testar Agora" e fale {getWakeWordPrompt()} para verificar a detecção no seu microfone.
+                </Text>
+              )}
+            </View>
+          </ScrollView>
 
           {/* Botão Fechar */}
           <TouchableOpacity style={styles.doneBtn} onPress={onClose}>
@@ -498,6 +602,52 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#64748b',
     fontStyle: 'italic',
+  },
+  scrollArea: {
+    maxHeight: 520,
+    marginBottom: 12,
+  },
+  wakeWordOptionList: {
+    gap: 8,
+  },
+  wakeWordOptionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    backgroundColor: '#fff',
+  },
+  wakeWordOptionBtnActive: {
+    borderColor: '#15803d',
+    backgroundColor: '#f0fdf4',
+  },
+  wakeWordOptionLabel: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#334155',
+  },
+  wakeWordOptionLabelActive: {
+    color: '#15803d',
+  },
+  wakeWordOptionDesc: {
+    fontSize: 11,
+    color: '#64748b',
+    marginTop: 2,
+  },
+  recommendedBadge: {
+    backgroundColor: '#dcfce7',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+  },
+  recommendedBadgeText: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#15803d',
   },
   doneBtn: {
     backgroundColor: '#15803d',

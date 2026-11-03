@@ -16,34 +16,139 @@ export interface WakeWordMetrics {
 
 export type WakeWordState = 'idle' | 'listening' | 'detected' | 'error';
 
-// Padrão acústico-fonético de referência para a palavra "PROFESSORA"
-// 12 fatias temporais (tempo normalizado de ~900ms) x 5 bandas de frequência:
+// Padrões acústico-fonéticos de referência para as 4 palavras sugeridas
+// 12 fatias temporais normalizadas x 5 bandas de frequência:
 // Banda 0: 100 - 450 Hz (F0 / Vogais baixas [o], [u])
 // Banda 1: 450 - 1100 Hz (Formante F1 [o], [e], [a])
 // Banda 2: 1100 - 2800 Hz (Formante F2 / ressonância de [r], [l])
 // Banda 3: 2800 - 5200 Hz (Fricativa [f] / início de sibilância)
-// Banda 4: 5200 - 8000 Hz (Sibilância intensa do duplo 's' em [so])
-const TARGET_PROFESSORA_MATRIX: number[][] = [
-  // Slice 0-2: "PRO" [p-r-o] -> Ataque plosivo com energia em graves e médios
-  [0.75, 0.65, 0.40, 0.15, 0.08],
-  [0.85, 0.80, 0.55, 0.20, 0.10],
-  [0.70, 0.75, 0.50, 0.25, 0.12],
+// Banda 4: 5200 - 8000 Hz (Sibilância intensa do duplo 's' em [so] / [si])
 
-  // Slice 3-5: "FES" [f-e-s] -> Fricativa 'f' e primeiro pico sibilante 's'
-  [0.35, 0.55, 0.70, 0.85, 0.65],
-  [0.30, 0.60, 0.75, 0.90, 0.80],
-  [0.40, 0.70, 0.80, 0.85, 0.75],
+interface WakeWordAcousticTarget {
+  key: 'professora' | 'assistente' | 'anotar' | 'gravar';
+  label: string;
+  minDurationMs: number;
+  maxDurationMs: number;
+  matrix: number[][];
+  bonusCheck?: (matrix: number[][]) => number;
+}
 
-  // Slice 6-8: "SO" [s-o] -> Sibilância máxima (duplo s) seguida de vogal 'o'
-  [0.25, 0.50, 0.70, 0.95, 0.92],
-  [0.45, 0.75, 0.65, 0.80, 0.70],
-  [0.60, 0.85, 0.60, 0.45, 0.30],
-
-  // Slice 9-11: "RA" [r-a] -> Consoante vibrante suave e vogal aberta final [a]
-  [0.70, 0.80, 0.55, 0.25, 0.12],
-  [0.75, 0.85, 0.60, 0.20, 0.08],
-  [0.45, 0.50, 0.35, 0.12, 0.05],
-];
+const TARGET_ACOUSTIC_MODELS: Record<string, WakeWordAcousticTarget> = {
+  professora: {
+    key: 'professora',
+    label: 'Professora',
+    minDurationMs: 520,
+    maxDurationMs: 1750,
+    matrix: [
+      // Slice 0-2: "PRO" [p-r-o] -> Ataque plosivo com graves e médios
+      [0.75, 0.65, 0.40, 0.15, 0.08],
+      [0.85, 0.80, 0.55, 0.20, 0.10],
+      [0.70, 0.75, 0.50, 0.25, 0.12],
+      // Slice 3-5: "FES" [f-e-s] -> Fricativa 'f' e sibilância 's'
+      [0.35, 0.55, 0.70, 0.85, 0.65],
+      [0.30, 0.60, 0.75, 0.90, 0.80],
+      [0.40, 0.70, 0.80, 0.85, 0.75],
+      // Slice 6-8: "SO" [s-o] -> Sibilância máxima (duplo s) seguida de 'o'
+      [0.25, 0.50, 0.70, 0.95, 0.92],
+      [0.45, 0.75, 0.65, 0.80, 0.70],
+      [0.60, 0.85, 0.60, 0.45, 0.30],
+      // Slice 9-11: "RA" [r-a] -> Consoante vibrante e vogal aberta [a]
+      [0.70, 0.80, 0.55, 0.25, 0.12],
+      [0.75, 0.85, 0.60, 0.20, 0.08],
+      [0.45, 0.50, 0.35, 0.12, 0.05],
+    ],
+    bonusCheck: (m) => {
+      const midSibilance = (m[5][4] + m[6][4] + m[7][4]) / 3;
+      const initialGraves = (m[0][0] + m[1][0] + m[2][0]) / 3;
+      return midSibilance > 0.40 && initialGraves > 0.35 ? 1.15 : 1.0;
+    },
+  },
+  assistente: {
+    key: 'assistente',
+    label: 'Assistente',
+    minDurationMs: 500,
+    maxDurationMs: 1750,
+    matrix: [
+      // Slice 0-2: "AS" -> Início suave seguido de rápida sibilância 's'
+      [0.40, 0.60, 0.60, 0.85, 0.80],
+      [0.30, 0.50, 0.70, 0.95, 0.90],
+      [0.25, 0.45, 0.75, 0.90, 0.85],
+      // Slice 3-5: "SIS" -> Vogal [i] com formante F2 alto e sibilância dupla
+      [0.30, 0.50, 0.85, 0.90, 0.88],
+      [0.35, 0.55, 0.80, 0.92, 0.85],
+      [0.40, 0.60, 0.75, 0.80, 0.70],
+      // Slice 6-8: "TEN" -> Oclusiva dental 't' e vogal nasal [en]
+      [0.60, 0.75, 0.70, 0.55, 0.35],
+      [0.70, 0.80, 0.65, 0.45, 0.25],
+      [0.65, 0.75, 0.60, 0.40, 0.20],
+      // Slice 9-11: "TE" -> Oclusiva final com vogal média-alta [e]
+      [0.55, 0.70, 0.65, 0.45, 0.20],
+      [0.50, 0.65, 0.60, 0.35, 0.15],
+      [0.40, 0.50, 0.45, 0.20, 0.10],
+    ],
+    bonusCheck: (m) => {
+      const sibilance = (m[1][4] + m[2][4] + m[3][4] + m[4][4]) / 4;
+      return sibilance > 0.45 ? 1.15 : 1.0;
+    },
+  },
+  anotar: {
+    key: 'anotar',
+    label: 'Anotar',
+    minDurationMs: 420,
+    maxDurationMs: 1400,
+    matrix: [
+      // Slice 0-2: "A" -> Vogal aberta inicial em médios-graves
+      [0.70, 0.90, 0.50, 0.20, 0.08],
+      [0.75, 0.95, 0.55, 0.20, 0.08],
+      [0.65, 0.85, 0.50, 0.25, 0.10],
+      // Slice 3-5: "NO" -> Formante nasal em graves seguido de vogal [o]
+      [0.85, 0.70, 0.40, 0.15, 0.08],
+      [0.80, 0.75, 0.45, 0.15, 0.08],
+      [0.70, 0.70, 0.50, 0.20, 0.10],
+      // Slice 6-8: "TA" -> Ataque plosivo dental [t] com abertura [a]
+      [0.45, 0.65, 0.75, 0.60, 0.35],
+      [0.70, 0.90, 0.65, 0.35, 0.15],
+      [0.75, 0.95, 0.60, 0.25, 0.10],
+      // Slice 9-11: "AR" -> Ressonância e decaimento com fricção vibrante
+      [0.65, 0.80, 0.55, 0.25, 0.12],
+      [0.55, 0.65, 0.50, 0.30, 0.18],
+      [0.40, 0.45, 0.35, 0.20, 0.10],
+    ],
+    bonusCheck: (m) => {
+      const openVowels = (m[0][1] + m[1][1] + m[7][1] + m[8][1]) / 4;
+      return openVowels > 0.50 ? 1.12 : 1.0;
+    },
+  },
+  gravar: {
+    key: 'gravar',
+    label: 'Gravar',
+    minDurationMs: 380,
+    maxDurationMs: 1300,
+    matrix: [
+      // Slice 0-2: "GRA" -> Ataque plosivo velar [g] com graves e vibrante [r]
+      [0.85, 0.75, 0.45, 0.18, 0.08],
+      [0.80, 0.85, 0.55, 0.20, 0.10],
+      [0.70, 0.90, 0.50, 0.25, 0.10],
+      // Slice 3-5: "A" -> Pico de vogal aberta
+      [0.70, 0.95, 0.55, 0.20, 0.08],
+      [0.65, 0.90, 0.50, 0.25, 0.10],
+      [0.50, 0.70, 0.60, 0.40, 0.25],
+      // Slice 6-8: "VA" -> Fricativa sonora labiodental [v] e vogal [a]
+      [0.50, 0.65, 0.70, 0.55, 0.30],
+      [0.65, 0.85, 0.65, 0.40, 0.18],
+      [0.70, 0.90, 0.60, 0.30, 0.12],
+      // Slice 9-11: "AR" -> Transição e decaimento final
+      [0.60, 0.75, 0.50, 0.25, 0.12],
+      [0.45, 0.55, 0.40, 0.20, 0.10],
+      [0.35, 0.40, 0.30, 0.15, 0.08],
+    ],
+    bonusCheck: (m) => {
+      const initialGraves = (m[0][0] + m[1][0]) / 2;
+      const midEnergy = (m[6][1] + m[7][1]) / 2;
+      return initialGraves > 0.45 && midEnergy > 0.40 ? 1.12 : 1.0;
+    },
+  },
+};
 
 // Limiares de sensibilidade
 const SENSITIVITY_THRESHOLDS = {
@@ -406,52 +511,69 @@ class OfflineWakeWordService {
     const frameCount = this.speechFrames.length;
     const durationMs = Date.now() - this.speechStartTime;
 
-    // A palavra "Professora" pronunciada em ritmo normal dura entre 600ms e 1600ms
-    if (durationMs < 550 || durationMs > 1750 || frameCount < 12) {
+    // Descarta ruídos ultracurtos (< 350ms) ou falas muito longas (> 2200ms)
+    if (durationMs < 350 || durationMs > 2200 || frameCount < 10) {
       return;
     }
 
-    // Normaliza a sequência temporal de frames para 12 fatias uniformes
-    const normalizedMatrix: number[][] = [];
-    const step = (frameCount - 1) / (TARGET_PROFESSORA_MATRIX.length - 1);
-
-    for (let i = 0; i < TARGET_PROFESSORA_MATRIX.length; i++) {
-      const targetIdx = Math.round(i * step);
-      const frame = this.speechFrames[Math.min(targetIdx, frameCount - 1)];
-      // Pega as 5 energias de banda
-      normalizedMatrix.push(frame.slice(0, 5));
-    }
-
-    // Compara a matriz temporal com o modelo de referência de "PROFESSORA"
-    const score = this.calculateSimilarity(normalizedMatrix, TARGET_PROFESSORA_MATRIX);
-
-    // Verificação de características fonéticas indispensáveis da palavra "Professora":
-    // 1. Presença marcante de sibilância no meio/fim ("feSSo" -> fatias 4 a 8)
-    const midSibilance =
-      (normalizedMatrix[5][4] + normalizedMatrix[6][4] + normalizedMatrix[7][4]) / 3;
-    const initialGraves =
-      (normalizedMatrix[0][0] + normalizedMatrix[1][0] + normalizedMatrix[2][0]) / 3;
-
-    // Bônus se apresentar o padrão clássico: início em graves ("pro") e meio com forte sibilância ("sso")
-    let finalScore = score;
-    if (midSibilance > 0.40 && initialGraves > 0.35) {
-      finalScore = Math.min(1.0, finalScore * 1.15);
-    }
-
     const settings = databaseService.getSettings();
+    const chosenWakeWord = (settings.wakeWord || 'todas').toLowerCase().trim();
     const sensitivity = settings.wakeWordSensitivity || 'media';
     const threshold = SENSITIVITY_THRESHOLDS[sensitivity] || 0.72;
 
-    const confidencePercent = Math.round(finalScore * 100);
+    // Determina quais modelos acústicos avaliar
+    const candidateModels: WakeWordAcousticTarget[] = [];
+    if (chosenWakeWord !== 'todas' && TARGET_ACOUSTIC_MODELS[chosenWakeWord]) {
+      candidateModels.push(TARGET_ACOUSTIC_MODELS[chosenWakeWord]);
+    } else {
+      candidateModels.push(...Object.values(TARGET_ACOUSTIC_MODELS));
+    }
+
+    let bestMatch: { target: WakeWordAcousticTarget; score: number } | null = null;
+
+    for (const target of candidateModels) {
+      // Verifica janela de duração aceitável para esta palavra específica
+      if (durationMs < target.minDurationMs * 0.85 || durationMs > target.maxDurationMs * 1.25) {
+        continue;
+      }
+
+      // Normaliza temporalmente para a matriz do alvo (12 fatias)
+      const normalizedMatrix: number[][] = [];
+      const step = (frameCount - 1) / (target.matrix.length - 1);
+
+      for (let i = 0; i < target.matrix.length; i++) {
+        const targetIdx = Math.round(i * step);
+        const frame = this.speechFrames[Math.min(targetIdx, frameCount - 1)];
+        normalizedMatrix.push(frame.slice(0, 5));
+      }
+
+      let score = this.calculateSimilarity(normalizedMatrix, target.matrix);
+
+      // Aplica bônus fonético se preencher os requisitos acústicos da palavra
+      if (target.bonusCheck) {
+        score = Math.min(1.0, score * target.bonusCheck(normalizedMatrix));
+      }
+
+      if (!bestMatch || score > bestMatch.score) {
+        bestMatch = { target, score };
+      }
+    }
+
+    if (!bestMatch) {
+      return;
+    }
+
+    const confidencePercent = Math.round(bestMatch.score * 100);
 
     this.onMetricsCallback?.({
       volumeDb: -20,
       isSpeechDetected: true,
       confidenceScore: confidencePercent,
+      detectedWord: bestMatch.target.label,
     });
 
-    if (finalScore >= threshold) {
-      this.triggerWakeWord('professora', confidencePercent);
+    if (bestMatch.score >= threshold) {
+      this.triggerWakeWord(bestMatch.target.key, confidencePercent);
     }
   }
 
